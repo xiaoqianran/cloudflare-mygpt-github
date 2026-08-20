@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker, { openApi, matchesRepoPattern } from "../src/index.js";
+import { assertWriteBranch, assertWritablePath } from "../src/policy.js";
 
 const envBase = {
   GPT_API_KEY: "test-gpt-key",
   GITHUB_TOKEN: "test-github-token",
-  ALLOWED_REPOS: "xiaoqianran/*",
-  WRITE_BRANCH_PREFIX: "mygpt/",
+  ALLOWED_REPOS: "*",
 };
 
 function post(path, body, key = "test-gpt-key") {
@@ -20,15 +20,26 @@ function post(path, body, key = "test-gpt-key") {
   });
 }
 
-test("repo allowlist wildcard still works", () => {
+test("global repository wildcard allows every owner/repo", () => {
+  assert.equal(matchesRepoPattern("xiaoqianran/demo", "*"), true);
+  assert.equal(matchesRepoPattern("MiaAI-Lab/Qwen3.8-27B-RTX-6000-PRO-SGLang-DSpark", "*"), true);
+  assert.equal(matchesRepoPattern("openai/openai", "*"), true);
   assert.equal(matchesRepoPattern("xiaoqianran/demo", "xiaoqianran/*"), true);
   assert.equal(matchesRepoPattern("other/demo", "xiaoqianran/*"), false);
 });
 
-test("OpenAPI exposes the v0.5 mirror tool surface", () => {
+test("high-level writes no longer block main or repository paths", () => {
+  assert.equal(assertWriteBranch({}, "main"), "main");
+  assert.equal(assertWriteBranch({}, "master"), "master");
+  assert.equal(assertWriteBranch({}, "release/v1"), "release/v1");
+  assert.equal(assertWritablePath(".github/workflows/test.yml"), ".github/workflows/test.yml");
+  assert.equal(assertWritablePath(".env"), ".env");
+});
+
+test("OpenAPI exposes the v0.6 mirror tool surface", () => {
   const spec = openApi("https://gateway.example");
   assert.equal(spec.openapi, "3.1.0");
-  assert.equal(spec.info.version, "0.5.0");
+  assert.equal(spec.info.version, "0.6.0");
   assert.equal(spec.servers[0].url, "https://gateway.example");
   assert.ok(spec.components && typeof spec.components === "object");
   assert.ok(spec.components.schemas && typeof spec.components.schemas === "object" && !Array.isArray(spec.components.schemas));
@@ -44,7 +55,7 @@ test("OpenAPI exposes the v0.5 mirror tool surface", () => {
 test("health and OpenAPI stay public", async () => {
   const health = await worker.fetch(new Request("https://gateway.example/health"), {});
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, "0.5.0");
+  assert.equal((await health.json()).version, "0.6.0");
 
   const schema = await worker.fetch(new Request("https://gateway.example/openapi.json"), {});
   assert.equal(schema.status, 200);
@@ -73,7 +84,7 @@ test("legacy X-API-Key is not accepted", async () => {
 
 test("mirror route reports missing binding clearly", async () => {
   const res = await worker.fetch(
-    post("/v1/repository/inspect", { repo: "xiaoqianran/demo" }),
+    post("/v1/repository/inspect", { repo: "MiaAI-Lab/Qwen3.8-27B-RTX-6000-PRO-SGLang-DSpark" }),
     envBase,
   );
   assert.equal(res.status, 503);
