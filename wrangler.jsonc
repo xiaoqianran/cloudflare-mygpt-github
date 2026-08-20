@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-mygpt-github",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-20",
+  "vars": {
+    "ALLOWED_REPOS": "xiaoqianran/*",
+    "WRITE_BRANCH_PREFIX": "mygpt/"
+  }
+}
