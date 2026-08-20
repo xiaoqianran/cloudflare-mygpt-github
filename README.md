@@ -6,10 +6,10 @@ A Cloudflare Worker gateway that lets a Custom GPT safely read and modify allowe
 
 ```text
 Custom GPT
-   │  X-API-Key: GPT_API_KEY
+   │  Authorization: Bearer <GPT_API_KEY>
    ▼
 Cloudflare Worker
-   ├─ auth
+   ├─ Bearer authentication
    ├─ repository allowlist
    ├─ path/branch policy
    ├─ GPT-optimized actions
@@ -28,11 +28,14 @@ The Worker deliberately exposes a very small action surface to the GPT:
 
 `GET /health` and `GET /openapi.json` remain public utility endpoints but are not exposed as GPT tools.
 
-## Why v0.2
+## Authentication
 
-v0.2 replaces the original low-level branch/commit/PR action set with four higher-level operations. This reduces GPT tool calls, makes multi-file edits atomic, and keeps the security policy in the Worker instead of relying on model instructions.
+The public client-facing credential and the GitHub credential are intentionally separate:
 
-The OpenAPI document is explicit OpenAPI 3.1 and always contains a real `components.schemas` object with named schemas and `$ref`s, matching the structure expected by Custom GPT Actions.
+- `GPT_API_KEY` — gateway token used by Custom GPT as `Authorization: Bearer <token>`
+- `GITHUB_TOKEN` — fine-grained GitHub PAT stored only in Cloudflare Secrets
+
+The gateway accepts **Bearer authentication only**. Legacy `X-API-Key` authentication is intentionally rejected.
 
 ## Safety defaults
 
@@ -88,7 +91,7 @@ curl "$BASE_URL/health"
 curl -s "$BASE_URL/openapi.json" | python -m json.tool
 
 curl -s "$BASE_URL/v1/repository/inspect" \
-  -H "X-API-Key: $GPT_API_KEY" \
+  -H "Authorization: Bearer $GPT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"repo":"xiaoqianran/cloudflare-mygpt-github"}'
 ```
@@ -98,9 +101,11 @@ curl -s "$BASE_URL/v1/repository/inspect" \
 In **GPTs → Create → Configure → Actions**:
 
 1. Import `https://<your-worker>/openapi.json`.
-2. Authentication: **API Key → Custom**.
-3. Header name: `X-API-Key`.
-4. API key value: the same value stored in the Worker secret `GPT_API_KEY`.
+2. Authentication: **API Key**.
+3. Authentication method: **Bearer**.
+4. API key value: enter the same value stored in Cloudflare as `GPT_API_KEY`.
+
+Do **not** include the word `Bearer` in the API-key value. ChatGPT adds the `Authorization: Bearer ...` header automatically.
 
 Do **not** put `GITHUB_TOKEN` into ChatGPT.
 
@@ -145,9 +150,9 @@ Example `applyChanges` request:
 
 Set `"create_pull_request": false` if you only want the commit.
 
-## Updating from v0.1
+## Updating from v0.2.0
 
-No secret rotation is required. Pull the latest code and redeploy:
+The Cloudflare secret value does not need to change. Pull and redeploy:
 
 ```bash
 git pull
@@ -156,7 +161,11 @@ npm test
 npm run deploy
 ```
 
-Then remove the old Action schema in the Custom GPT and import `/openapi.json` again so ChatGPT sees the v0.2 operations.
+Then in the Custom GPT Action settings:
+
+1. Re-import `/openapi.json`.
+2. Change authentication from **Custom / X-API-Key** to **Bearer**.
+3. Paste the existing `GPT_API_KEY` value as the API key.
 
 ## Tests
 
@@ -164,4 +173,4 @@ Then remove the old Action schema in the Custom GPT and import `/openapi.json` a
 npm test
 ```
 
-Tests mock GitHub HTTP calls and cover OpenAPI shape, authentication, allowlists, sensitive paths, repository inspection, batch reads, code search, atomic commits, draft PR creation and optimistic concurrency.
+Tests mock GitHub HTTP calls and cover OpenAPI shape, Bearer-only authentication, allowlists, sensitive paths, repository inspection, batch reads, code search, atomic commits, draft PR creation and optimistic concurrency.
