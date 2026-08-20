@@ -17,7 +17,7 @@ export function openApi(origin) {
     openapi: "3.1.0",
     info: {
       title: "MyGPT GitHub Repository Mirror",
-      version: "0.6.0",
+      version: "0.6.1",
       description: "Fast GitHub repository access for Custom GPT. All repositories are accepted by the gateway; actual private/read/write capability is determined by GITHUB_TOKEN permissions and GitHub repository rules. Reads come from a Cloudflare D1/R2 mirror; GitHub is used for sync and writes.",
     },
     servers: [{ url: origin }],
