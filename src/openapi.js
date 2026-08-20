@@ -17,8 +17,8 @@ export function openApi(origin) {
     openapi: "3.1.0",
     info: {
       title: "MyGPT GitHub Repository Mirror",
-      version: "0.6.1",
-      description: "Fast GitHub repository access for Custom GPT. All repositories are accepted by the gateway; actual private/read/write capability is determined by GITHUB_TOKEN permissions and GitHub repository rules. Reads come from a Cloudflare D1/R2 mirror; GitHub is used for sync and writes.",
+      version: "0.7.0",
+      description: "Fast GitHub repository access for Custom GPT. All repositories are accepted by the gateway; actual private/read/write capability is determined by GITHUB_TOKEN permissions and GitHub repository rules. Reads come from a Cloudflare D1/R2 mirror. The mirror uses free-tier-aware TTL, per-repository storage caps and R2 garbage collection.",
     },
     servers: [{ url: origin }],
     security: [{ BearerAuth: [] }],
@@ -95,7 +95,7 @@ export function openApi(origin) {
         post: {
           operationId: "syncRepository",
           summary: "Start or refresh the Cloudflare repository mirror",
-          description: "Use only when the mirror is missing/stale or the user asks for the latest GitHub state. This queues an asynchronous sync and returns immediately. Set force=true to replace a failed or stuck queued/syncing job.",
+          description: "Use only when the mirror is missing/stale or the user asks for the latest GitHub state. This queues an asynchronous sync and returns immediately. Set force=true to replace a failed or stuck queued/syncing job. Idle non-pinned mirrors may be automatically evicted and rebuilt later.",
           requestBody: jsonBody({ $ref: "#/components/schemas/SyncRepositoryRequest" }),
           responses: { "202": { description: "Sync queued" }, "400": { $ref: "#/components/responses/BadRequest" }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" } },
         },
@@ -104,7 +104,7 @@ export function openApi(origin) {
         post: {
           operationId: "inspectRepository",
           summary: "Inspect mirrored repository metadata and file tree",
-          description: "Call this first. It is a fast D1 lookup and reports mirror status, commit SHA and repository paths without calling GitHub.",
+          description: "Call this first. It is a fast D1 lookup and reports mirror status, commit SHA and repository paths without calling GitHub. Successful access refreshes the mirror's idle TTL.",
           requestBody: jsonBody({ $ref: "#/components/schemas/InspectRepositoryRequest" }),
           responses: { "200": { description: "Mirror metadata and files" }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" } },
         },
@@ -113,7 +113,7 @@ export function openApi(origin) {
         post: {
           operationId: "readFiles",
           summary: "Batch-read repository files from the R2 mirror",
-          description: "Uses R2 for mirrored text files. GitHub is contacted only for a cache miss, oversized file, binary, or a different ref.",
+          description: "Uses R2 for mirrored text files. GitHub is contacted only for a cache miss, oversized file, budget-evicted file, binary, or a different ref.",
           requestBody: jsonBody({ $ref: "#/components/schemas/ReadFilesRequest" }),
           responses: { "200": { description: "File contents" }, "400": { $ref: "#/components/responses/BadRequest" }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" } },
         },
@@ -122,7 +122,7 @@ export function openApi(origin) {
         post: {
           operationId: "searchRepository",
           summary: "Full-text search inside the mirrored repository",
-          description: "Searches the local D1 FTS5 index instead of GitHub Code Search.",
+          description: "Searches the local D1 FTS5 index instead of GitHub Code Search. Index content is intentionally capped to reduce D1 usage on the Cloudflare free tier.",
           requestBody: jsonBody({ $ref: "#/components/schemas/SearchRepositoryRequest" }),
           responses: { "200": { description: "Search results" }, "400": { $ref: "#/components/responses/BadRequest" }, "409": { $ref: "#/components/responses/Conflict" } },
         },
@@ -131,7 +131,7 @@ export function openApi(origin) {
         post: {
           operationId: "readRepositoryPage",
           summary: "Read the whole repository progressively from the mirror",
-          description: "Returns a deterministic page of mirrored text files under a character budget. Keep following next_cursor until it is null to traverse all mirrored source files.",
+          description: "Returns a deterministic page of currently mirrored text files under a character budget. Keep following next_cursor until it is null. Files evicted by storage limits can still be fetched explicitly through readFiles.",
           requestBody: jsonBody({ $ref: "#/components/schemas/ReadRepositoryPageRequest" }),
           responses: { "200": { description: "Repository page" }, "409": { $ref: "#/components/responses/Conflict" } },
         },
