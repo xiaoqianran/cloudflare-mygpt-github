@@ -1,5 +1,5 @@
 import { HttpError } from "./errors.js";
-import { github, encodeRepoPath, decodeBase64Utf8 } from "./github.js";
+import { github, githubApiHeaders, encodeRepoPath, decodeBase64Utf8 } from "./github.js";
 import { normalizeRepo, assertRepoAllowed, validateReadPaths } from "./policy.js";
 
 const DEFAULT_MAX_MIRROR_FILE_BYTES = 1_000_000;
@@ -340,11 +340,7 @@ async function githubGraphqlBlobs(env, repo, headSha, files) {
   const transport = env.__graphqlFetch || fetch;
   const response = await transport("https://api.github.com/graphql", {
     method: "POST",
-    headers: {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      "content-type": "application/json",
-    },
+    headers: githubApiHeaders(env, { "content-type": "application/json" }),
     body: JSON.stringify({ query, variables }),
   });
   const payload = await response.json();
