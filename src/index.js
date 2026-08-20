@@ -2,6 +2,7 @@ import { HttpError } from "./errors.js";
 import { json, corsHeaders, bodyJson, assertAuthorized } from "./http.js";
 import { inspectRepository, readFiles, searchCode, applyChanges } from "./actions.js";
 import { openApi as buildOpenApi } from "./openapi.js";
+import { handleGitBridge, parseGitRoute } from "./git-bridge.js";
 
 export function openApi(origin) {
   return buildOpenApi(origin);
@@ -11,10 +12,16 @@ async function route(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.2.1" });
+    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.3.0" });
   }
   if (request.method === "GET" && url.pathname === "/openapi.json") {
     return json(openApi(url.origin));
+  }
+
+  // Native Git uses HTTP Basic auth and binary Smart HTTP payloads. Route it
+  // before the JSON/Bearer Custom GPT control plane.
+  if (parseGitRoute(url.pathname)) {
+    return handleGitBridge(request, env);
   }
 
   assertAuthorized(request, env);
@@ -34,7 +41,11 @@ export default {
       const response = await route(request, env);
       const headers = new Headers(response.headers);
       for (const [key, value] of Object.entries(corsHeaders())) headers.set(key, value);
-      return new Response(response.body, { status: response.status, headers });
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500;
       const payload = { error: error instanceof Error ? error.message : "internal error" };
@@ -45,3 +56,4 @@ export default {
 };
 
 export { matchesRepoPattern } from "./policy.js";
+export { parseGitRoute } from "./git-bridge.js";
