@@ -6,6 +6,6 @@
   "vars": {
     "ALLOWED_REPOS": "xiaoqianran/*",
     "WRITE_BRANCH_PREFIX": "mygpt/",
-    "ENABLE_GIT_PUSH": "false"
+    "ENABLE_GIT_PUSH": "true"
   }
 }
