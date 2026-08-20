@@ -1,0 +1,2 @@
+ALTER TABLE repositories
+  ADD COLUMN tree_truncated INTEGER NOT NULL DEFAULT 0;
