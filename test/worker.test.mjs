@@ -51,7 +51,7 @@ test("OpenAPI is GPT Actions friendly and declares Bearer auth", () => {
 test("health and OpenAPI are public", async () => {
   const health = await worker.fetch(new Request("https://gateway.example/health"), {});
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, "0.3.0");
+  assert.equal((await health.json()).version, "0.4.0");
   const schema = await worker.fetch(new Request("https://gateway.example/openapi.json"), {});
   assert.equal(schema.status, 200);
   assert.ok((await schema.json()).components.schemas.ApplyChangesRequest);
