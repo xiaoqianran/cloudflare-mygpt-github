@@ -5,6 +5,34 @@
   "compatibility_date": "2026-08-20",
   "vars": {
     "ALLOWED_REPOS": "xiaoqianran/*",
-    "WRITE_BRANCH_PREFIX": "mygpt/"
+    "WRITE_BRANCH_PREFIX": "mygpt/",
+    "MAX_MIRROR_FILE_BYTES": "1000000",
+    "MAX_INDEX_CHARS": "120000"
+  },
+  "d1_databases": [
+    {
+      "binding": "REPO_DB",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "REPO_BLOBS"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "REPO_SYNC_QUEUE",
+        "queue": "cloudflare-mygpt-github-sync"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "cloudflare-mygpt-github-sync",
+        "max_batch_size": 5,
+        "max_batch_timeout": 1
+      }
+    ]
   }
 }
