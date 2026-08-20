@@ -23,8 +23,7 @@ A Cloudflare Worker gateway that gives Custom GPTs and local Git clients control
              GPT_API_KEY│     │ GIT_GATEWAY_TOKEN
                         │     │
                  Custom GPT   Local Git
-                              clone/fetch/pull
-                              optional push
+                              clone/fetch/pull/push
 ```
 
 The important separation is intentional:
@@ -33,7 +32,7 @@ The important separation is intentional:
 - **Native Git data plane** uses Git Smart HTTP under `/git/...` with HTTP Basic authentication. The Basic password is `GIT_GATEWAY_TOKEN`, never the GitHub PAT.
 - **GitHub authentication** uses `GITHUB_TOKEN` only inside the Worker.
 
-Your local machine only needs to resolve/reach the Cloudflare Worker. `git clone`, `git fetch`, and `git pull` are proxied and streamed by Cloudflare to GitHub, so the local Git client does not need to connect to `github.com`.
+Your local machine only needs to resolve/reach the Cloudflare Worker. `git clone`, `git fetch`, `git pull`, and allowed `git push` operations are proxied by Cloudflare to GitHub, so the local Git client does not need to connect to `github.com`.
 
 ## Custom GPT actions
 
@@ -60,7 +59,7 @@ POST /git/{owner}/{repo}.git/git-receive-pack
 
 ### Clone / fetch / pull
 
-These are supported by default and streamed end-to-end without buffering repository packfiles in Worker memory.
+These are supported and streamed end-to-end without buffering repository packfiles in Worker memory.
 
 Example:
 
@@ -86,13 +85,13 @@ git commit -m "feat: local change"
 
 ### Native `git push`
 
-Push is implemented but **disabled by default**:
+Push is **enabled by default**:
 
 ```jsonc
-"ENABLE_GIT_PUSH": "false"
+"ENABLE_GIT_PUSH": "true"
 ```
 
-This is deliberate. When enabled, the Worker inspects the `git-receive-pack` command section before streaming the pack to GitHub and only permits updates to:
+The Worker inspects the `git-receive-pack` command section before streaming the pack to GitHub and only permits updates to:
 
 ```text
 refs/heads/mygpt/*
@@ -100,29 +99,25 @@ refs/heads/mygpt/*
 
 It blocks pushes to `main`, `master`, tags, other branches, and branch deletion.
 
-To enable it, change `wrangler.jsonc` to:
-
-```jsonc
-"ENABLE_GIT_PUSH": "true"
-```
-
-then redeploy:
-
-```bash
-npm run deploy
-```
-
-Now a normal local push works:
+Normal local push:
 
 ```bash
 git push -u origin mygpt/local-change
 ```
 
-**Important:** the Git wire protocol does not mark a ref update as “force” in a way this streaming gateway can reliably distinguish without understanding the incoming pack graph. Therefore force-updating an allowed `mygpt/*` branch cannot be completely prevented at the Worker layer. Keep important branches protected on GitHub; `main/master` are already unreachable through this bridge because the Worker rejects those refs before forwarding the pack.
+If you ever want to disable native push again, set:
+
+```jsonc
+"ENABLE_GIT_PUSH": "false"
+```
+
+and redeploy.
+
+**Important:** the Git wire protocol does not mark a ref update as “force” in a way this streaming gateway can reliably distinguish without understanding the incoming pack graph. Therefore force-updating an allowed `mygpt/*` branch cannot be completely prevented at the Worker layer. Keep important branches protected on GitHub; `main/master` are unreachable through this bridge because the Worker rejects those refs before forwarding the pack.
 
 ## Cloudflare limits
 
-This architecture is a good fit for normal source repositories because Worker responses can be streamed without an enforced response-body limit. Native pushes are inbound requests, so Cloudflare account request-body limits still apply (for example, 100 MB on Free/Pro at the time of v0.3).
+This architecture is a good fit for normal source repositories because Worker responses can be streamed without an enforced response-body limit. Native pushes are inbound requests, so Cloudflare account request-body limits still apply.
 
 Consequences:
 
@@ -141,7 +136,7 @@ For very large pushes/LFS, use a VPS/tunnel-based Git proxy rather than forcing 
 - native Git uses a separate `GIT_GATEWAY_TOKEN`
 - direct GPT writes to `main` / `master` are blocked
 - GPT writes must target `mygpt/*`
-- native Git push, when enabled, may only update `mygpt/*`
+- native Git push may only update `mygpt/*`
 - `.env`, private keys, and credential files cannot be read/written through GPT actions
 - `.github/workflows/*` cannot be modified through GPT actions
 - GPT Git ref updates use `force: false`
@@ -186,7 +181,7 @@ Default policy in `wrangler.jsonc`:
   "vars": {
     "ALLOWED_REPOS": "xiaoqianran/*",
     "WRITE_BRANCH_PREFIX": "mygpt/",
-    "ENABLE_GIT_PUSH": "false"
+    "ENABLE_GIT_PUSH": "true"
   }
 }
 ```
@@ -247,6 +242,6 @@ A pure GitHub REST gateway is excellent for GPT Actions but cannot create a real
 
 - **high-level JSON actions** where safety and deterministic AI behavior matter;
 - **streaming Smart HTTP** where native Git protocol compatibility matters;
-- native push remains opt-in and restricted to disposable `mygpt/*` branches.
+- native push is enabled and restricted to disposable `mygpt/*` branches.
 
 That keeps the gateway small while preserving both AI-agent workflows and real local Git workflows.
