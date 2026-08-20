@@ -35,6 +35,7 @@ export function openApi(origin) {
         SyncRepositoryRequest: objectSchema({
           repo: { type: "string", description: "Any GitHub repository in owner/name format. Access is limited only by GITHUB_TOKEN and GitHub itself." },
           ref: { type: "string", description: "Optional branch, tag, or commit. Defaults to the repository default branch." },
+          force: { type: "boolean", default: false, description: "Start a fresh sync even if an earlier sync is still marked queued or syncing. Use after a failed/stuck mirror job or when explicitly refreshing." },
         }, ["repo"]),
         InspectRepositoryRequest: objectSchema({
           repo: { type: "string" },
@@ -94,7 +95,7 @@ export function openApi(origin) {
         post: {
           operationId: "syncRepository",
           summary: "Start or refresh the Cloudflare repository mirror",
-          description: "Use only when the mirror is missing/stale or the user asks for the latest GitHub state. This queues an asynchronous sync and returns immediately.",
+          description: "Use only when the mirror is missing/stale or the user asks for the latest GitHub state. This queues an asynchronous sync and returns immediately. Set force=true to replace a failed or stuck queued/syncing job.",
           requestBody: jsonBody({ $ref: "#/components/schemas/SyncRepositoryRequest" }),
           responses: { "202": { description: "Sync queued" }, "400": { $ref: "#/components/responses/BadRequest" }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" } },
         },
