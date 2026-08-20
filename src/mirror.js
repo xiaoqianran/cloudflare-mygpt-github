@@ -64,7 +64,8 @@ function decodeCursor(cursor) {
 async function getRepositoryRow(env, repo) {
   return env.REPO_DB.prepare(
     `SELECT repo, ref, head_sha, default_branch, status, sync_id, pending_batches,
-            file_count, mirrored_file_count, total_bytes, sync_started_at, synced_at, last_error
+            file_count, mirrored_file_count, total_bytes, tree_truncated,
+            sync_started_at, synced_at, last_error
        FROM repositories WHERE repo = ?`,
   ).bind(repo).first();
 }
@@ -93,8 +94,8 @@ export async function startMirrorSync(env, input) {
     env.REPO_DB.prepare(
       `INSERT INTO repositories
          (repo, ref, head_sha, status, sync_id, pending_batches, file_count,
-          mirrored_file_count, total_bytes, sync_started_at, last_error)
-       VALUES (?, ?, NULL, 'queued', ?, 0, 0, 0, 0, ?, NULL)
+          mirrored_file_count, total_bytes, tree_truncated, sync_started_at, last_error)
+       VALUES (?, ?, NULL, 'queued', ?, 0, 0, 0, 0, 0, ?, NULL)
        ON CONFLICT(repo) DO UPDATE SET
          ref = excluded.ref,
          head_sha = NULL,
@@ -104,6 +105,7 @@ export async function startMirrorSync(env, input) {
          file_count = 0,
          mirrored_file_count = 0,
          total_bytes = 0,
+         tree_truncated = 0,
          sync_started_at = excluded.sync_started_at,
          last_error = NULL`,
     ).bind(repo, ref || "@default", syncId, startedAt),
@@ -163,6 +165,7 @@ export async function inspectMirror(env, input) {
     file_count: row.file_count,
     mirrored_file_count: row.mirrored_file_count,
     total_bytes: row.total_bytes,
+    tree_truncated: Boolean(row.tree_truncated),
     sync_started_at: row.sync_started_at,
     synced_at: row.synced_at,
     last_error: row.last_error,
@@ -302,7 +305,7 @@ export async function readMirrorPage(env, input) {
 
     lastCompletedPath = file.path;
     if (chars >= maxChars) {
-      nextCursor = encodeCursor(file.path, 0);
+      if (processedRows < rows.length) nextCursor = encodeCursor(file.path, 0);
       break;
     }
   }
@@ -364,7 +367,7 @@ async function maybeFinalizeSync(env, repo, syncId) {
   ).bind(syncId).first();
   if (manifest?.status !== "done") return;
 
-  const truncated = row.last_error === "GitHub recursive tree was truncated";
+  const truncated = Number(row.tree_truncated || 0) === 1;
   const statements = [];
   if (!truncated) {
     statements.push(
@@ -380,9 +383,15 @@ async function maybeFinalizeSync(env, repo, syncId) {
   statements.push(
     env.REPO_DB.prepare(
       `UPDATE repositories
-          SET status = ?, pending_batches = 0, synced_at = ?
+          SET status = ?, pending_batches = 0, synced_at = ?, last_error = ?
         WHERE repo = ? AND sync_id = ? AND pending_batches = 0`,
-    ).bind(truncated ? "partial" : "ready", nowIso(), repo, syncId),
+    ).bind(
+      truncated ? "partial" : "ready",
+      nowIso(),
+      truncated ? "GitHub recursive tree was truncated" : null,
+      repo,
+      syncId,
+    ),
   );
   await env.REPO_DB.batch(statements);
 }
@@ -391,7 +400,10 @@ async function processManifest(env, message) {
   const marker = await env.REPO_DB.prepare(
     `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = '__manifest__'`,
   ).bind(message.sync_id).first();
-  if (marker?.status === "done") return;
+  if (marker?.status === "done") {
+    await maybeFinalizeSync(env, message.repo, message.sync_id);
+    return;
+  }
 
   let current = await getRepositoryRow(env, message.repo);
   if (!current || current.sync_id !== message.sync_id) return;
@@ -427,7 +439,7 @@ async function processManifest(env, message) {
   await env.REPO_DB.prepare(
     `UPDATE repositories
         SET ref = ?, head_sha = ?, default_branch = ?, status = ?, pending_batches = ?,
-            file_count = ?, mirrored_file_count = 0, total_bytes = ?, last_error = ?
+            file_count = ?, mirrored_file_count = 0, total_bytes = ?, tree_truncated = ?, last_error = NULL
       WHERE repo = ? AND sync_id = ? AND head_sha IS NULL`,
   ).bind(
     ref,
@@ -437,7 +449,7 @@ async function processManifest(env, message) {
     fileChunks.length,
     files.length,
     totalBytes,
-    tree.truncated ? "GitHub recursive tree was truncated" : null,
+    tree.truncated ? 1 : 0,
     message.repo,
     message.sync_id,
   ).run();
@@ -482,7 +494,10 @@ async function processManifestChunk(env, message) {
   const prior = await env.REPO_DB.prepare(
     `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = ?`,
   ).bind(message.sync_id, message.batch_id).first();
-  if (prior?.status === "done") return;
+  if (prior?.status === "done") {
+    await maybeFinalizeSync(env, message.repo, message.sync_id);
+    return;
+  }
 
   const paths = message.files.map((file) => file.path);
   const placeholders = paths.map(() => "?").join(",");
