@@ -9,7 +9,7 @@ export function corsHeaders() {
   return {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type,x-api-key,authorization",
+    "access-control-allow-headers": "content-type,authorization",
   };
 }
 
@@ -36,14 +36,13 @@ export async function bodyJson(request) {
   }
 }
 
-function readApiKey(request) {
-  const direct = request.headers.get("x-api-key");
-  if (direct) return direct;
+function readBearerToken(request) {
   const auth = request.headers.get("authorization") || "";
-  return auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
 }
 
 export function assertAuthorized(request, env) {
   if (!env.GPT_API_KEY) throw new HttpError(500, "GPT_API_KEY secret is not configured");
-  if (readApiKey(request) !== env.GPT_API_KEY) throw new HttpError(401, "unauthorized");
+  if (readBearerToken(request) !== env.GPT_API_KEY) throw new HttpError(401, "unauthorized");
 }
