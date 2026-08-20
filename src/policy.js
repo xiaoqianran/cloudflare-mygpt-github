@@ -1,6 +1,5 @@
 import { HttpError } from "./errors.js";
 
-const DEFAULT_WRITE_PREFIX = "mygpt/";
 const MAX_READ_FILES = 20;
 const MAX_CHANGES = 50;
 const MAX_FILE_CHARS = 750_000;
@@ -17,13 +16,17 @@ function parseAllowlist(value = "") {
 }
 
 export function matchesRepoPattern(repo, pattern) {
+  if (pattern === "*") return true;
   if (pattern.endsWith("/*")) return repo.startsWith(pattern.slice(0, -1));
   return repo === pattern;
 }
 
 export function assertRepoAllowed(env, repo) {
-  const patterns = parseAllowlist(env.ALLOWED_REPOS || "");
-  if (patterns.length === 0 || !patterns.some((pattern) => matchesRepoPattern(repo, pattern))) {
+  // Default to unrestricted repository access. GitHub itself remains the source
+  // of truth: public repositories are readable, and private/write access is
+  // limited only by GITHUB_TOKEN permissions and repository rules.
+  const patterns = parseAllowlist(env.ALLOWED_REPOS || "*");
+  if (!patterns.some((pattern) => matchesRepoPattern(repo, pattern))) {
     throw new HttpError(403, `repository is not allowed: ${repo}`);
   }
 }
@@ -39,45 +42,22 @@ function validateRelativePath(path) {
   return path;
 }
 
-function isSensitivePath(path) {
-  const lower = path.toLowerCase();
-  const basename = lower.split("/").at(-1);
-  return (
-    basename === ".env" ||
-    basename?.startsWith(".env.") ||
-    basename === "credentials" ||
-    basename === "credentials.json" ||
-    basename === "id_rsa" ||
-    basename === "id_ed25519" ||
-    lower.endsWith(".pem") ||
-    lower.endsWith(".key") ||
-    lower.endsWith(".p12") ||
-    lower.endsWith(".pfx")
-  );
-}
-
-// Read access intentionally covers every valid repository-relative path. The
-// mirror is meant to let Custom GPT understand the whole repository, including
-// files that the old safety-focused reader used to hide.
+// Reads intentionally cover every valid repository-relative path so Custom GPT
+// can understand the whole repository.
 export function assertReadablePath(path) {
   return validateRelativePath(path);
 }
 
+// Writes are intentionally unrestricted at the gateway policy layer. GitHub
+// token scopes, repository permissions, branch protection and rulesets decide
+// what the authenticated token can actually change.
 export function assertWritablePath(path) {
-  validateRelativePath(path);
-  const lower = path.toLowerCase();
-  if (isSensitivePath(path) || lower.startsWith(".github/workflows/")) {
-    throw new HttpError(403, `protected path is blocked: ${path}`);
-  }
-  return path;
+  return validateRelativePath(path);
 }
 
-export function assertWriteBranch(env, branch) {
+export function assertWriteBranch(_env, branch) {
   if (typeof branch !== "string" || !branch) throw new HttpError(400, "branch is required");
-  if (branch === "main" || branch === "master") throw new HttpError(403, `direct writes to ${branch} are blocked`);
-  const prefix = env.WRITE_BRANCH_PREFIX || DEFAULT_WRITE_PREFIX;
-  if (!branch.startsWith(prefix)) throw new HttpError(403, `write branch must start with ${prefix}`);
-  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..") || branch.endsWith("/")) {
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..") || branch.startsWith("/") || branch.endsWith("/")) {
     throw new HttpError(400, "branch contains unsupported characters");
   }
   return branch;
