@@ -5,6 +5,7 @@
   "compatibility_date": "2026-08-20",
   "vars": {
     "ALLOWED_REPOS": "xiaoqianran/*",
-    "WRITE_BRANCH_PREFIX": "mygpt/"
+    "WRITE_BRANCH_PREFIX": "mygpt/",
+    "ENABLE_GIT_PUSH": "false"
   }
 }
