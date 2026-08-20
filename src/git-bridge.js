@@ -56,7 +56,6 @@ function pushEnabled(env) {
 
 function githubGitAuthorization(env) {
   if (!env.GITHUB_TOKEN) throw new HttpError(500, "GITHUB_TOKEN secret is not configured");
-  // GitHub HTTPS Git accepts a personal access token as the Basic-auth password.
   return `Basic ${btoa(`x-access-token:${env.GITHUB_TOKEN}`)}`;
 }
 
@@ -112,6 +111,7 @@ async function inspectReceivePackBody(body) {
   const reader = inspectionStream.getReader();
   let buffer = new Uint8Array(0);
   let offset = 0;
+  let commandBytes = 0;
   let first = true;
   const commands = [];
 
@@ -132,12 +132,13 @@ async function inspectReceivePackBody(body) {
       const packetLength = Number.parseInt(prefix, 16);
 
       if (packetLength === 0) {
-        offset += 4;
-        if (offset > MAX_COMMAND_SECTION_BYTES) throw new HttpError(413, "git command section is too large");
+        commandBytes += 4;
+        if (commandBytes > MAX_COMMAND_SECTION_BYTES) throw new HttpError(413, "git command section is too large");
         break;
       }
       if (packetLength < 4) throw new HttpError(400, "unsupported git pkt-line control packet");
-      if (offset + packetLength > MAX_COMMAND_SECTION_BYTES) {
+      commandBytes += packetLength;
+      if (commandBytes > MAX_COMMAND_SECTION_BYTES) {
         throw new HttpError(413, "git command section is too large");
       }
 
@@ -156,11 +157,19 @@ async function inspectReceivePackBody(body) {
       first = false;
       offset += packetLength;
     }
+  } catch (error) {
+    void forwardStream.cancel().catch(() => {});
+    throw error;
   } finally {
-    await reader.cancel().catch(() => {});
+    // Do not await cancel() on one side of a tee: its promise may wait for the
+    // other branch to finish, which would deadlock before we forward it.
+    void reader.cancel().catch(() => {});
   }
 
-  if (commands.length === 0) throw new HttpError(400, "git push contained no ref updates");
+  if (commands.length === 0) {
+    void forwardStream.cancel().catch(() => {});
+    throw new HttpError(400, "git push contained no ref updates");
+  }
   return { commands, forwardStream };
 }
 
@@ -181,8 +190,6 @@ async function fetchGitHubSmart(env, url, init) {
   const transport = env.__gitFetch || fetch;
   const response = await transport(url, { ...init, redirect: "manual" });
   if (response.status >= 300 && response.status < 400) {
-    // Never expose a GitHub redirect to the local Git client, otherwise the client
-    // could bypass this gateway (and its DNS/network isolation) or leak credentials.
     throw new HttpError(502, "GitHub Smart HTTP returned a redirect; use the repository's current canonical name");
   }
   return response;
@@ -226,7 +233,12 @@ export async function handleGitBridge(request, env) {
       throw new HttpError(415, "compressed git-receive-pack requests are not supported because ref updates must be inspected");
     }
     const inspected = await inspectReceivePackBody(request.body);
-    validatePushCommands(inspected.commands, env);
+    try {
+      validatePushCommands(inspected.commands, env);
+    } catch (error) {
+      void inspected.forwardStream.cancel().catch(() => {});
+      throw error;
+    }
     body = inspected.forwardStream;
   }
 
