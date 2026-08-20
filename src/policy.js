@@ -56,10 +56,11 @@ function isSensitivePath(path) {
   );
 }
 
+// Read access intentionally covers every valid repository-relative path. The
+// mirror is meant to let Custom GPT understand the whole repository, including
+// files that the old safety-focused reader used to hide.
 export function assertReadablePath(path) {
-  validateRelativePath(path);
-  if (isSensitivePath(path)) throw new HttpError(403, `sensitive path is blocked: ${path}`);
-  return path;
+  return validateRelativePath(path);
 }
 
 export function assertWritablePath(path) {
