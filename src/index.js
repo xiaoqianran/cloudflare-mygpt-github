@@ -1,10 +1,10 @@
 import { HttpError } from "./errors.js";
 import { json, corsHeaders, bodyJson, assertAuthorized } from "./http.js";
 import { inspectRepository, readFiles, searchCode, applyChanges } from "./actions.js";
-import { openApi as buildOpenApi, withResponses } from "./openapi.js";
+import { openApi as buildOpenApi } from "./openapi.js";
 
 export function openApi(origin) {
-  return withResponses(buildOpenApi(origin));
+  return buildOpenApi(origin);
 }
 
 async function route(request, env) {
