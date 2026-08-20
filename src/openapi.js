@@ -5,14 +5,19 @@ export function openApi(origin) {
     openapi: "3.1.0",
     info: {
       title: "MyGPT GitHub Gateway",
-      version: "0.2.0",
+      version: "0.2.1",
       description: "A minimal, safety-focused GitHub read/write gateway for Custom GPT Actions.",
     },
     servers: [{ url: origin }],
-    security: [{ ApiKeyAuth: [] }],
+    security: [{ BearerAuth: [] }],
     components: {
       securitySchemes: {
-        ApiKeyAuth: { type: "apiKey", in: "header", name: "X-API-Key" },
+        BearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "opaque",
+          description: "Use the same secret value stored in Cloudflare as GPT_API_KEY.",
+        },
       },
       schemas: {
         InspectRepositoryRequest: {
