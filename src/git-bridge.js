@@ -1,10 +1,7 @@
 import { HttpError } from "./errors.js";
-import { normalizeRepo, assertRepoAllowed } from "./policy.js";
+import { normalizeRepo } from "./policy.js";
 
 const GITHUB_WEB = "https://github.com";
-const MAX_COMMAND_SECTION_BYTES = 64 * 1024;
-const MAX_INSPECTION_BUFFER_BYTES = 1024 * 1024;
-const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
 function gitAuthChallenge() {
   return new Response("Git gateway authentication required\n", {
@@ -50,10 +47,6 @@ export function parseGitRoute(pathname) {
   };
 }
 
-function pushEnabled(env) {
-  return /^(1|true|yes|on)$/i.test(String(env.ENABLE_GIT_PUSH || "false"));
-}
-
 function githubGitAuthorization(env) {
   if (!env.GITHUB_TOKEN) throw new HttpError(500, "GITHUB_TOKEN secret is not configured");
   return `Basic ${btoa(`x-access-token:${env.GITHUB_TOKEN}`)}`;
@@ -61,7 +54,7 @@ function githubGitAuthorization(env) {
 
 function upstreamHeaders(request, env) {
   const headers = new Headers();
-  for (const name of ["accept", "content-type", "git-protocol", "user-agent"]) {
+  for (const name of ["accept", "content-type", "content-encoding", "git-protocol", "user-agent"]) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
@@ -88,102 +81,17 @@ function downstreamHeaders(upstream) {
   return headers;
 }
 
-function concatBytes(left, right) {
-  const output = new Uint8Array(left.length + right.length);
-  output.set(left, 0);
-  output.set(right, left.length);
-  return output;
-}
-
-function parseCommandPayload(payload, first) {
-  let line = new TextDecoder().decode(payload).replace(/\n$/, "");
-  if (first) line = line.split("\0", 1)[0];
-  const parts = line.split(" ");
-  if (parts.length !== 3 || !SHA_RE.test(parts[0]) || !SHA_RE.test(parts[1]) || !parts[2].startsWith("refs/")) {
-    throw new HttpError(400, "unsupported git receive-pack command");
-  }
-  return { oldSha: parts[0], newSha: parts[1], ref: parts[2] };
-}
-
-async function inspectReceivePackBody(body) {
-  if (!body) throw new HttpError(400, "git-receive-pack request body is required");
-  const [inspectionStream, forwardStream] = body.tee();
-  const reader = inspectionStream.getReader();
-  let buffer = new Uint8Array(0);
-  let offset = 0;
-  let commandBytes = 0;
-  let first = true;
-  const commands = [];
-
-  try {
-    while (true) {
-      while (buffer.length - offset < 4) {
-        const { value, done } = await reader.read();
-        if (done) throw new HttpError(400, "truncated git receive-pack command section");
-        buffer = concatBytes(buffer.slice(offset), value);
-        offset = 0;
-        if (buffer.length > MAX_INSPECTION_BUFFER_BYTES) {
-          throw new HttpError(413, "git receive-pack inspection buffer exceeded");
-        }
-      }
-
-      const prefix = new TextDecoder().decode(buffer.slice(offset, offset + 4));
-      if (!/^[0-9a-fA-F]{4}$/.test(prefix)) throw new HttpError(400, "invalid git pkt-line length");
-      const packetLength = Number.parseInt(prefix, 16);
-
-      if (packetLength === 0) {
-        commandBytes += 4;
-        if (commandBytes > MAX_COMMAND_SECTION_BYTES) throw new HttpError(413, "git command section is too large");
-        break;
-      }
-      if (packetLength < 4) throw new HttpError(400, "unsupported git pkt-line control packet");
-      commandBytes += packetLength;
-      if (commandBytes > MAX_COMMAND_SECTION_BYTES) {
-        throw new HttpError(413, "git command section is too large");
-      }
-
-      while (buffer.length - offset < packetLength) {
-        const { value, done } = await reader.read();
-        if (done) throw new HttpError(400, "truncated git pkt-line");
-        buffer = concatBytes(buffer.slice(offset), value);
-        offset = 0;
-        if (buffer.length > MAX_INSPECTION_BUFFER_BYTES) {
-          throw new HttpError(413, "git receive-pack inspection buffer exceeded");
-        }
-      }
-
-      const payload = buffer.slice(offset + 4, offset + packetLength);
-      commands.push(parseCommandPayload(payload, first));
-      first = false;
-      offset += packetLength;
+function validateMethodAndService(request, url, endpoint) {
+  if (endpoint === "info/refs") {
+    if (request.method !== "GET") throw new HttpError(405, "info/refs requires GET");
+    const service = url.searchParams.get("service");
+    if (service !== "git-upload-pack" && service !== "git-receive-pack") {
+      throw new HttpError(400, "unsupported Git Smart HTTP service");
     }
-  } catch (error) {
-    void forwardStream.cancel().catch(() => {});
-    throw error;
-  } finally {
-    // Do not await cancel() on one side of a tee: its promise may wait for the
-    // other branch to finish, which would deadlock before we forward it.
-    void reader.cancel().catch(() => {});
+    return;
   }
 
-  if (commands.length === 0) {
-    void forwardStream.cancel().catch(() => {});
-    throw new HttpError(400, "git push contained no ref updates");
-  }
-  return { commands, forwardStream };
-}
-
-function validatePushCommands(commands, env) {
-  const branchPrefix = env.WRITE_BRANCH_PREFIX || "mygpt/";
-  const allowedRefPrefix = `refs/heads/${branchPrefix}`;
-  for (const command of commands) {
-    if (!command.ref.startsWith(allowedRefPrefix)) {
-      throw new HttpError(403, `git push may only update ${allowedRefPrefix}*`);
-    }
-    if (/^0+$/.test(command.newSha)) {
-      throw new HttpError(403, "git branch deletion through the gateway is blocked");
-    }
-  }
+  if (request.method !== "POST") throw new HttpError(405, `${endpoint} requires POST`);
 }
 
 async function fetchGitHubSmart(env, url, init) {
@@ -195,26 +103,6 @@ async function fetchGitHubSmart(env, url, init) {
   return response;
 }
 
-function validateMethodAndService(request, url, endpoint, env) {
-  if (endpoint === "info/refs") {
-    if (request.method !== "GET") throw new HttpError(405, "info/refs requires GET");
-    const service = url.searchParams.get("service");
-    if (service !== "git-upload-pack" && service !== "git-receive-pack") {
-      throw new HttpError(400, "unsupported Git Smart HTTP service");
-    }
-    if (service === "git-receive-pack" && !pushEnabled(env)) {
-      throw new HttpError(403, "git push through the gateway is disabled");
-    }
-    return service;
-  }
-
-  if (request.method !== "POST") throw new HttpError(405, `${endpoint} requires POST`);
-  if (endpoint === "git-receive-pack" && !pushEnabled(env)) {
-    throw new HttpError(403, "git push through the gateway is disabled");
-  }
-  return endpoint;
-}
-
 export async function handleGitBridge(request, env) {
   const url = new URL(request.url);
   const route = parseGitRoute(url.pathname);
@@ -223,30 +111,13 @@ export async function handleGitBridge(request, env) {
   if (!isGitClientAuthorized(request, env)) return gitAuthChallenge();
 
   const repo = normalizeRepo(route.repo);
-  assertRepoAllowed(env, repo);
-  validateMethodAndService(request, url, route.endpoint, env);
-
-  let body = request.method === "POST" ? request.body : undefined;
-  if (route.endpoint === "git-receive-pack") {
-    const encoding = request.headers.get("content-encoding");
-    if (encoding && encoding.toLowerCase() !== "identity") {
-      throw new HttpError(415, "compressed git-receive-pack requests are not supported because ref updates must be inspected");
-    }
-    const inspected = await inspectReceivePackBody(request.body);
-    try {
-      validatePushCommands(inspected.commands, env);
-    } catch (error) {
-      void inspected.forwardStream.cancel().catch(() => {});
-      throw error;
-    }
-    body = inspected.forwardStream;
-  }
+  validateMethodAndService(request, url, route.endpoint);
 
   const upstreamUrl = `${GITHUB_WEB}/${repo}.git/${route.endpoint}${route.endpoint === "info/refs" ? url.search : ""}`;
   const upstream = await fetchGitHubSmart(env, upstreamUrl, {
     method: request.method,
     headers: upstreamHeaders(request, env),
-    ...(body ? { body } : {}),
+    ...(request.method === "POST" && request.body ? { body: request.body } : {}),
   });
 
   return new Response(upstream.body, {
@@ -255,5 +126,3 @@ export async function handleGitBridge(request, env) {
     headers: downstreamHeaders(upstream),
   });
 }
-
-export { inspectReceivePackBody, validatePushCommands };
