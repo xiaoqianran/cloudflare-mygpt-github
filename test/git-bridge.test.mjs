@@ -6,9 +6,6 @@ const envBase = {
   GPT_API_KEY: "test-gpt-key",
   GIT_GATEWAY_TOKEN: "test-git-gateway-key",
   GITHUB_TOKEN: "test-github-token",
-  ALLOWED_REPOS: "xiaoqianran/*",
-  WRITE_BRANCH_PREFIX: "mygpt/",
-  ENABLE_GIT_PUSH: "false",
 };
 
 function basic(token = envBase.GIT_GATEWAY_TOKEN, username = "git") {
@@ -24,19 +21,6 @@ function gitRequest(path, { method = "GET", body, token, headers = {} } = {}) {
     },
     ...(body !== undefined ? { body } : {}),
   });
-}
-
-function pktLine(payload) {
-  const bytes = Buffer.from(payload, "utf8");
-  const length = (bytes.length + 4).toString(16).padStart(4, "0");
-  return Buffer.concat([Buffer.from(length, "ascii"), bytes]);
-}
-
-function receivePackBody(ref) {
-  const oldSha = "0".repeat(40);
-  const newSha = "1".repeat(40);
-  const command = pktLine(`${oldSha} ${newSha} ${ref}\0report-status side-band-64k\n`);
-  return Buffer.concat([command, Buffer.from("0000", "ascii"), Buffer.from("PACKfake", "ascii")]);
 }
 
 test("git bridge route parser only accepts Smart HTTP endpoints", () => {
@@ -56,7 +40,7 @@ test("native Git gets a Basic-auth challenge", async () => {
   assert.match(res.headers.get("www-authenticate") || "", /^Basic /);
 });
 
-test("upload-pack advertisement is streamed through GitHub without leaking client credentials", async () => {
+test("upload-pack is streamed and client credentials are replaced with GitHub credentials", async () => {
   let seenUrl;
   let seenInit;
   const upstreamBytes = Uint8Array.from([0x30, 0x30, 0x30, 0x38, 0x4e, 0x41, 0x4b, 0x0a]);
@@ -73,14 +57,14 @@ test("upload-pack advertisement is streamed through GitHub without leaking clien
   };
 
   const res = await worker.fetch(
-    gitRequest("/git/xiaoqianran/demo.git/info/refs?service=git-upload-pack", {
+    gitRequest("/git/any-owner/any-repo.git/info/refs?service=git-upload-pack", {
       headers: { "git-protocol": "version=2" },
     }),
     env,
   );
 
   assert.equal(res.status, 200);
-  assert.equal(seenUrl, "https://github.com/xiaoqianran/demo.git/info/refs?service=git-upload-pack");
+  assert.equal(seenUrl, "https://github.com/any-owner/any-repo.git/info/refs?service=git-upload-pack");
   assert.equal(seenInit.headers.get("git-protocol"), "version=2");
   assert.equal(
     seenInit.headers.get("authorization"),
@@ -90,37 +74,37 @@ test("upload-pack advertisement is streamed through GitHub without leaking clien
   assert.deepEqual(new Uint8Array(await res.arrayBuffer()), upstreamBytes);
 });
 
-test("git receive-pack is disabled by default", async () => {
-  const res = await worker.fetch(
-    gitRequest("/git/xiaoqianran/demo.git/info/refs?service=git-receive-pack"),
-    envBase,
-  );
-  assert.equal(res.status, 403);
-});
-
-test("git push cannot update main even when native push is enabled", async () => {
-  const env = { ...envBase, ENABLE_GIT_PUSH: "true" };
-  const res = await worker.fetch(
-    gitRequest("/git/xiaoqianran/demo.git/git-receive-pack", {
-      method: "POST",
-      body: receivePackBody("refs/heads/main"),
-      headers: { "content-type": "application/x-git-receive-pack-request" },
-    }),
-    env,
-  );
-  assert.equal(res.status, 403);
-  assert.match((await res.json()).error, /refs\/heads\/mygpt\//);
-});
-
-test("mygpt branch push is inspected then streamed unchanged", async () => {
-  const original = receivePackBody("refs/heads/mygpt/local-test");
-  let forwarded;
+test("receive-pack advertisement is always enabled", async () => {
   let seenUrl;
   const env = {
     ...envBase,
-    ENABLE_GIT_PUSH: "true",
+    __gitFetch: async (url) => {
+      seenUrl = url;
+      return new Response("advertisement", {
+        status: 200,
+        headers: { "content-type": "application/x-git-receive-pack-advertisement" },
+      });
+    },
+  };
+
+  const res = await worker.fetch(
+    gitRequest("/git/xiaoqianran/demo.git/info/refs?service=git-receive-pack"),
+    env,
+  );
+  assert.equal(res.status, 200);
+  assert.equal(seenUrl, "https://github.com/xiaoqianran/demo.git/info/refs?service=git-receive-pack");
+});
+
+test("receive-pack request is forwarded byte-for-byte without ref policy inspection", async () => {
+  const original = Buffer.from("arbitrary-git-receive-pack-binary-body\0\x01\x02", "binary");
+  let forwarded;
+  let seenUrl;
+  let seenContentEncoding;
+  const env = {
+    ...envBase,
     __gitFetch: async (url, init) => {
       seenUrl = url;
+      seenContentEncoding = init.headers.get("content-encoding");
       forwarded = Buffer.from(await new Response(init.body).arrayBuffer());
       return new Response("ok", {
         status: 200,
@@ -133,30 +117,47 @@ test("mygpt branch push is inspected then streamed unchanged", async () => {
     gitRequest("/git/xiaoqianran/demo.git/git-receive-pack", {
       method: "POST",
       body: original,
-      headers: { "content-type": "application/x-git-receive-pack-request" },
+      headers: {
+        "content-type": "application/x-git-receive-pack-request",
+        "content-encoding": "identity",
+      },
     }),
     env,
   );
 
   assert.equal(res.status, 200);
   assert.equal(seenUrl, "https://github.com/xiaoqianran/demo.git/git-receive-pack");
+  assert.equal(seenContentEncoding, "identity");
   assert.deepEqual(forwarded, original);
 });
 
-test("git branch deletion through receive-pack is blocked", async () => {
-  const oldSha = "1".repeat(40);
-  const newSha = "0".repeat(40);
-  const command = pktLine(`${oldSha} ${newSha} refs/heads/mygpt/delete-me\0report-status\n`);
-  const body = Buffer.concat([command, Buffer.from("0000", "ascii")]);
-  const env = { ...envBase, ENABLE_GIT_PUSH: "true" };
-  const res = await worker.fetch(
-    gitRequest("/git/xiaoqianran/demo.git/git-receive-pack", {
-      method: "POST",
-      body,
-      headers: { "content-type": "application/x-git-receive-pack-request" },
-    }),
-    env,
-  );
-  assert.equal(res.status, 403);
-  assert.match((await res.json()).error, /deletion/);
+test("gateway does not block main, tags, deletes, or force-style ref updates", async () => {
+  const payloads = [
+    "push-main",
+    "push-tag",
+    "delete-branch",
+    "force-update",
+  ];
+  const forwarded = [];
+  const env = {
+    ...envBase,
+    __gitFetch: async (_url, init) => {
+      forwarded.push(await new Response(init.body).text());
+      return new Response("ok", { status: 200 });
+    },
+  };
+
+  for (const payload of payloads) {
+    const res = await worker.fetch(
+      gitRequest("/git/xiaoqianran/demo.git/git-receive-pack", {
+        method: "POST",
+        body: payload,
+        headers: { "content-type": "application/x-git-receive-pack-request" },
+      }),
+      env,
+    );
+    assert.equal(res.status, 200);
+  }
+
+  assert.deepEqual(forwarded, payloads);
 });
