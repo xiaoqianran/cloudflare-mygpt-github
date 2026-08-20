@@ -45,6 +45,7 @@ test("OpenAPI exposes the v0.6.1 mirror tool surface", () => {
   assert.ok(spec.components.schemas && typeof spec.components.schemas === "object" && !Array.isArray(spec.components.schemas));
   assert.equal(spec.components.securitySchemes.BearerAuth.type, "http");
   assert.equal(spec.components.securitySchemes.BearerAuth.scheme, "bearer");
+  assert.equal(spec.components.schemas.SyncRepositoryRequest.properties.force.type, "boolean");
   assert.deepEqual(spec.security, [{ BearerAuth: [] }]);
   assert.deepEqual(
     Object.values(spec.paths).map((path) => path.post.operationId).sort(),
