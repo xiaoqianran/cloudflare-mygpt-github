@@ -1,6 +1,14 @@
 import { HttpError } from "./errors.js";
 import { json, corsHeaders, bodyJson, assertAuthorized } from "./http.js";
-import { inspectRepository, readFiles, searchCode, applyChanges } from "./actions.js";
+import { applyChanges } from "./actions.js";
+import {
+  startMirrorSync,
+  inspectMirror,
+  readMirrorFiles,
+  searchMirror,
+  readMirrorPage,
+  handleMirrorQueue,
+} from "./mirror.js";
 import { openApi as buildOpenApi } from "./openapi.js";
 import { handleGitBridge, parseGitRoute } from "./git-bridge.js";
 
@@ -12,25 +20,24 @@ async function route(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.4.0" });
+    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.5.0" });
   }
   if (request.method === "GET" && url.pathname === "/openapi.json") {
     return json(openApi(url.origin));
   }
 
-  // Native Git uses HTTP Basic auth and binary Smart HTTP payloads. Route it
-  // before the JSON/Bearer Custom GPT control plane.
-  if (parseGitRoute(url.pathname)) {
-    return handleGitBridge(request, env);
-  }
+  // Native Git remains a separate transparent Smart HTTP data plane.
+  if (parseGitRoute(url.pathname)) return handleGitBridge(request, env);
 
   assertAuthorized(request, env);
   if (request.method !== "POST") throw new HttpError(405, "method not allowed");
   const input = await bodyJson(request);
 
-  if (url.pathname === "/v1/repository/inspect") return json(await inspectRepository(env, input));
-  if (url.pathname === "/v1/files/read") return json(await readFiles(env, input));
-  if (url.pathname === "/v1/code/search") return json(await searchCode(env, input));
+  if (url.pathname === "/v1/repository/sync") return json(await startMirrorSync(env, input), 202);
+  if (url.pathname === "/v1/repository/inspect") return json(await inspectMirror(env, input));
+  if (url.pathname === "/v1/files/read") return json(await readMirrorFiles(env, input));
+  if (url.pathname === "/v1/repository/search") return json(await searchMirror(env, input));
+  if (url.pathname === "/v1/repository/page") return json(await readMirrorPage(env, input));
   if (url.pathname === "/v1/changes/apply") return json(await applyChanges(env, input));
   throw new HttpError(404, "not found");
 }
@@ -52,6 +59,10 @@ export default {
       if (error instanceof HttpError && error.details !== undefined) payload.details = error.details;
       return json(payload, status, corsHeaders());
     }
+  },
+
+  async queue(batch, env) {
+    await handleMirrorQueue(batch, env);
   },
 };
 
