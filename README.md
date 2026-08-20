@@ -2,7 +2,7 @@
 
 Cloudflare gateway for fast Custom GPT access to GitHub repositories.
 
-The core v0.5 design is a **repository mirror**:
+The core v0.6 design is a **repository mirror** with gateway-side repository restrictions removed:
 
 ```text
 GitHub
@@ -20,9 +20,17 @@ Custom GPT
 
 After the first sync, normal GPT reads and searches no longer need GitHub API calls.
 
+By default:
+
+```text
+ALLOWED_REPOS=*
+```
+
+So the gateway accepts **any GitHub owner/repository**. Public repositories can be mirrored when GitHub allows access. Private repository reads and all writes are determined by `GITHUB_TOKEN` permissions plus GitHub branch protection/rulesets. The Worker no longer adds an owner allowlist, main/master block, branch-prefix requirement, sensitive-path block, or workflow-path block to `applyChanges`.
+
 Native Git Smart HTTP remains available as a separate optional data plane for local `clone/fetch/pull/push`.
 
-## Why v0.5
+## Why the mirror exists
 
 The old flow was still:
 
@@ -32,7 +40,7 @@ Custom GPT -> Worker -> GitHub API
 
 That removed ChatGPT's built-in GitHub connector, but large repository work could still be dominated by GitHub API latency and rate limits.
 
-v0.5 changes the hot path to:
+The hot path is now:
 
 ```text
 Custom GPT -> Worker -> D1 / R2
@@ -63,12 +71,12 @@ Actions:
 - `readFiles` — batch-read mirrored text files from R2
 - `searchRepository` — search the D1 FTS5 index instead of GitHub Code Search
 - `readRepositoryPage` — progressively traverse the entire mirrored text repository under a context budget
-- `applyChanges` — write changes back to GitHub
+- `applyChanges` — write changes back to any repository/branch/path permitted by `GITHUB_TOKEN` and GitHub
 
 Recommended GPT instruction:
 
 ```text
-For GitHub tasks, call inspectRepository first. If the mirror is missing or stale, call syncRepository and inspect again until it is ready. Use searchRepository and readFiles for targeted work. For a whole-repository review, repeatedly call readRepositoryPage using next_cursor until it is null. Do not use GitHub directly when the mirror can answer the request.
+For GitHub tasks, always prefer these custom actions over ChatGPT's built-in GitHub tools. Call inspectRepository first. If the mirror is missing or stale, call syncRepository and inspect again until it is ready. Use searchRepository and readFiles for targeted work. For a whole-repository review, repeatedly call readRepositoryPage using next_cursor until it is null. Do not use GitHub directly when the mirror can answer the request.
 ```
 
 ## Mirror lifecycle
@@ -117,10 +125,12 @@ This does not mean the entire repository is injected into one model context. It 
 Defaults in `wrangler.jsonc`:
 
 ```jsonc
+"ALLOWED_REPOS": "*",
 "MAX_MIRROR_FILE_BYTES": "1000000",
 "MAX_INDEX_CHARS": "120000"
 ```
 
+- all repository names pass the gateway repository policy
 - text files up to 1 MB are eligible for the R2 mirror
 - the first 120k characters of each mirrored text file are indexed in D1 FTS5
 - full mirrored file text remains in R2
@@ -130,7 +140,7 @@ If GitHub's recursive tree reports truncation, the mirror is marked `partial` an
 
 ## Cloudflare resources
 
-v0.5 uses three bindings:
+The mirror uses three bindings:
 
 ```text
 REPO_DB          D1
@@ -138,7 +148,7 @@ REPO_BLOBS       R2
 REPO_SYNC_QUEUE  Queue
 ```
 
-Wrangler 4.45+ supports automatic resource provisioning for D1/R2, and current Wrangler also supports automatic provisioning for Queues. The repository therefore does not contain account-specific resource IDs.
+The repository does not contain account-specific resource IDs.
 
 ## First deployment / upgrade
 
@@ -160,7 +170,7 @@ npx wrangler secret put GIT_GATEWAY_TOKEN
 
 `GIT_GATEWAY_TOKEN` is only needed if you use the native Git bridge.
 
-For the first v0.5 deployment run:
+Deploy/update:
 
 ```bash
 npm run setup
@@ -170,23 +180,18 @@ npm run setup
 
 ```text
 wrangler deploy
-  -> auto-provisions/binds D1 + R2 + Queue
-
 wrangler d1 migrations apply REPO_DB --remote
-  -> creates repository mirror tables + FTS5 index
 ```
 
-After that, normal updates use:
+After migrations are already current, normal updates can use:
 
 ```bash
 npm run deploy
 ```
 
-If Wrangler writes provisioned D1/R2 identifiers back into your local `wrangler.jsonc`, that is expected. Do not manually invent resource IDs.
-
 ## First repository sync
 
-After deployment, configure the Custom GPT Action schema again from `/openapi.json`, then ask the GPT to sync a repository.
+After deployment, configure the Custom GPT Action schema again from `/openapi.json`, then ask the GPT to sync any repository.
 
 Equivalent API call:
 
@@ -196,7 +201,7 @@ export BASE_URL="https://cloudflare-mygpt-github.<your-subdomain>.workers.dev"
 curl -s "$BASE_URL/v1/repository/sync" \
   -H "Authorization: Bearer $GPT_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"repo":"xiaoqianran/cloudflare-mygpt-github"}'
+  -d '{"repo":"MiaAI-Lab/Qwen3.8-27B-RTX-6000-PRO-SGLang-DSpark"}'
 ```
 
 The response is immediate and should contain `status: queued`.
@@ -207,7 +212,7 @@ Check progress:
 curl -s "$BASE_URL/v1/repository/inspect" \
   -H "Authorization: Bearer $GPT_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"repo":"xiaoqianran/cloudflare-mygpt-github"}'
+  -d '{"repo":"MiaAI-Lab/Qwen3.8-27B-RTX-6000-PRO-SGLang-DSpark"}'
 ```
 
 Expected states:
@@ -217,38 +222,3 @@ missing -> queued -> syncing -> ready
 ```
 
 `partial` means GitHub returned a truncated recursive tree. `error`/`last_error` exposes sync failures without exposing secrets.
-
-## Native Git bridge
-
-This remains separate from the GPT mirror:
-
-```text
-GET  /git/{owner}/{repo}.git/info/refs?service=git-upload-pack
-POST /git/{owner}/{repo}.git/git-upload-pack
-GET  /git/{owner}/{repo}.git/info/refs?service=git-receive-pack
-POST /git/{owner}/{repo}.git/git-receive-pack
-```
-
-Example:
-
-```bash
-export GATEWAY_HOST="cloudflare-mygpt-github.<your-subdomain>.workers.dev"
-git clone "https://git@${GATEWAY_HOST}/git/xiaoqianran/cloudflare-mygpt-github.git"
-```
-
-Use `GIT_GATEWAY_TOKEN` as the HTTP Basic password. Native Git is intentionally transparent after authentication; GitHub token permissions and GitHub repository rules determine what pushes are accepted.
-
-## Secrets and trust boundaries
-
-```text
-GPT_API_KEY
-  Custom GPT -> Worker only
-
-GIT_GATEWAY_TOKEN
-  Local Git -> Worker only
-
-GITHUB_TOKEN
-  Worker -> GitHub only
-```
-
-Never put `GITHUB_TOKEN` into a Custom GPT or local Git remote URL.
