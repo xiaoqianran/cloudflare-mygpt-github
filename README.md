@@ -1,8 +1,13 @@
 # cloudflare-mygpt-github
 
-A Cloudflare Worker gateway that gives Custom GPTs and local Git clients controlled access to allowed GitHub repositories without exposing the GitHub token to either client.
+Cloudflare Worker gateway for two independent workflows:
 
-## v0.3 architecture
+1. **Custom GPT → GitHub** through a small JSON/OpenAPI control plane.
+2. **Local Git → GitHub** through a native Git Smart HTTP bridge.
+
+The GitHub credential never needs to be stored in ChatGPT or in the local Git remote URL. `GITHUB_TOKEN` stays in Cloudflare Secrets.
+
+## Architecture
 
 ```text
                          GitHub
@@ -12,12 +17,9 @@ A Cloudflare Worker gateway that gives Custom GPTs and local Git clients control
                            │
                  ┌─────────┴─────────┐
                  │ Cloudflare Worker │
-                 │                   │
-                 │ policy / allowlist│
-                 │ auth / streaming  │
                  └──────┬─────┬──────┘
                         │     │
-          control plane │     │ data plane
+          control plane │     │ native Git data plane
                         │     │
               Bearer    │     │ HTTP Basic
              GPT_API_KEY│     │ GIT_GATEWAY_TOKEN
@@ -26,28 +28,26 @@ A Cloudflare Worker gateway that gives Custom GPTs and local Git clients control
                               clone/fetch/pull/push
 ```
 
-The important separation is intentional:
+## Native Git mode: unrestricted after authentication
 
-- **Custom GPT control plane** uses `Authorization: Bearer <GPT_API_KEY>` and four high-level JSON actions.
-- **Native Git data plane** uses Git Smart HTTP under `/git/...` with HTTP Basic authentication. The Basic password is `GIT_GATEWAY_TOKEN`, never the GitHub PAT.
-- **GitHub authentication** uses `GITHUB_TOKEN` only inside the Worker.
+v0.4 makes the native Git side a transparent authenticated Smart HTTP proxy.
 
-Your local machine only needs to resolve/reach the Cloudflare Worker. `git clone`, `git fetch`, `git pull`, and allowed `git push` operations are proxied by Cloudflare to GitHub, so the local Git client does not need to connect to `github.com`.
+After a client authenticates with `GIT_GATEWAY_TOKEN`, the Worker does **not** impose repository/ref policy on Git traffic. GitHub itself and the permissions of `GITHUB_TOKEN` are the authority.
 
-## Custom GPT actions
+The gateway therefore allows whatever GitHub accepts, including:
 
-The Worker exposes only four GPT-facing tools:
+- clone / fetch / pull
+- push to `main`, `master`, or any other branch
+- create/update/delete branches
+- create/update/delete tags
+- force push / non-fast-forward updates
+- repositories outside `xiaoqianran/*` when `GITHUB_TOKEN` has permission to access them
 
-- `inspectRepository` — metadata + repository tree
-- `readFiles` — batch-read repository files
-- `searchCode` — repository-scoped GitHub code search
-- `applyChanges` — create/reuse `mygpt/*`, atomically commit multiple files, and optionally create/reuse a draft PR
+The Worker does not parse or rewrite `git-receive-pack`; the binary request body is streamed upstream unchanged.
 
-`GET /health` and `GET /openapi.json` are public utility endpoints but are not GPT tools.
+Authentication is still required. This is intentional: removing authentication would turn the Worker into a public write proxy backed by your GitHub credential.
 
-## Native Git bridge
-
-Smart HTTP routes are deliberately separate from the GPT OpenAPI schema:
+### Git Smart HTTP routes
 
 ```text
 GET  /git/{owner}/{repo}.git/info/refs?service=git-upload-pack
@@ -57,11 +57,7 @@ GET  /git/{owner}/{repo}.git/info/refs?service=git-receive-pack
 POST /git/{owner}/{repo}.git/git-receive-pack
 ```
 
-### Clone / fetch / pull
-
-These are supported and streamed end-to-end without buffering repository packfiles in Worker memory.
-
-Example:
+### Clone
 
 ```bash
 export GATEWAY_HOST="cloudflare-mygpt-github.<your-subdomain>.workers.dev"
@@ -69,81 +65,62 @@ export GATEWAY_HOST="cloudflare-mygpt-github.<your-subdomain>.workers.dev"
 git clone "https://git@${GATEWAY_HOST}/git/xiaoqianran/cloudflare-mygpt-github.git"
 ```
 
-Git will ask for a password. Enter the value stored in Cloudflare as `GIT_GATEWAY_TOKEN`.
+Git asks for a password. Enter the value stored as `GIT_GATEWAY_TOKEN`.
 
-After cloning, all normal local operations are local and do not contact GitHub:
+The resulting `origin` points to the Worker, so later Git network operations continue to use Cloudflare rather than contacting `github.com` directly.
+
+### Local edit and commit
 
 ```bash
 cd cloudflare-mygpt-github
-git switch -c mygpt/local-change
 # edit files
 git add .
 git commit -m "feat: local change"
 ```
 
-`git fetch` / `git pull` continue to use the Worker because `origin` points at the gateway URL.
+`git commit` is completely local and works even without network access.
 
-### Native `git push`
+### Push
 
-Push is **enabled by default**:
-
-```jsonc
-"ENABLE_GIT_PUSH": "true"
-```
-
-The Worker inspects the `git-receive-pack` command section before streaming the pack to GitHub and only permits updates to:
-
-```text
-refs/heads/mygpt/*
-```
-
-It blocks pushes to `main`, `master`, tags, other branches, and branch deletion.
-
-Normal local push:
+Push is enabled by default and has no Worker-side ref restriction:
 
 ```bash
-git push -u origin mygpt/local-change
+git push origin main
+git push --force origin main
+git push origin --tags
+git push origin --delete some-branch
 ```
 
-If you ever want to disable native push again, set:
+Whether a push succeeds is determined by GitHub repository settings, branch protection/rulesets, and the permissions/scopes of `GITHUB_TOKEN`.
 
-```jsonc
-"ENABLE_GIT_PUSH": "false"
+## Custom GPT control plane
+
+The Custom GPT side remains separate from native Git and uses:
+
+```http
+Authorization: Bearer <GPT_API_KEY>
 ```
 
-and redeploy.
+GPT-facing actions:
 
-**Important:** the Git wire protocol does not mark a ref update as “force” in a way this streaming gateway can reliably distinguish without understanding the incoming pack graph. Therefore force-updating an allowed `mygpt/*` branch cannot be completely prevented at the Worker layer. Keep important branches protected on GitHub; `main/master` are unreachable through this bridge because the Worker rejects those refs before forwarding the pack.
+- `inspectRepository`
+- `readFiles`
+- `searchCode`
+- `applyChanges`
 
-## Cloudflare limits
+Schema:
 
-This architecture is a good fit for normal source repositories because Worker responses can be streamed without an enforced response-body limit. Native pushes are inbound requests, so Cloudflare account request-body limits still apply.
+```text
+https://<your-worker>/openapi.json
+```
 
-Consequences:
+In **GPTs → Create → Configure → Actions** use **API Key → Bearer**, with the same value stored in the Worker secret `GPT_API_KEY`.
 
-- clone/fetch of large normal repositories is much less constrained because the large pack travels in the response direction;
-- a single native push whose HTTP request body exceeds your Cloudflare plan limit will fail before it reaches the Worker;
-- Git LFS is not proxied in v0.3;
-- submodules whose `.gitmodules` URLs point directly at GitHub will also bypass this gateway unless their URLs are rewritten.
+Do not put `GITHUB_TOKEN` or `GIT_GATEWAY_TOKEN` in the Custom GPT.
 
-For very large pushes/LFS, use a VPS/tunnel-based Git proxy rather than forcing that traffic through Workers.
+The GPT JSON actions still use their own higher-level policy. The unrestricted behavior described above applies specifically to native Git Smart HTTP traffic under `/git/...`.
 
-## Safety defaults
-
-- only repositories matching `ALLOWED_REPOS` are accessible
-- `GITHUB_TOKEN` never leaves Cloudflare Secrets
-- GPT actions use Bearer auth, not the GitHub token
-- native Git uses a separate `GIT_GATEWAY_TOKEN`
-- direct GPT writes to `main` / `master` are blocked
-- GPT writes must target `mygpt/*`
-- native Git push may only update `mygpt/*`
-- `.env`, private keys, and credential files cannot be read/written through GPT actions
-- `.github/workflows/*` cannot be modified through GPT actions
-- GPT Git ref updates use `force: false`
-- `expected_head_sha` can guard GPT writes against concurrent branch changes
-- GPT-created PRs are draft by default
-
-## Deploy / upgrade
+## Deploy
 
 Requirements: Node.js 20+ and a Cloudflare account.
 
@@ -156,13 +133,8 @@ npx wrangler login
 Configure secrets:
 
 ```bash
-# GitHub PAT: only Cloudflare knows this
 npx wrangler secret put GITHUB_TOKEN
-
-# Custom GPT -> Worker Bearer token
 npx wrangler secret put GPT_API_KEY
-
-# Native Git -> Worker Basic-auth password
 npx wrangler secret put GIT_GATEWAY_TOKEN
 ```
 
@@ -172,23 +144,9 @@ Deploy:
 npm run deploy
 ```
 
-Use a fine-grained GitHub PAT scoped only to repositories this gateway should access. For the current feature set, use repository `Contents: Read and write` and `Pull requests: Read and write`.
+For native Git, `GITHUB_TOKEN` determines the real GitHub permission boundary. Use a GitHub token with the repository access and write permissions you actually want the gateway to have.
 
-Default policy in `wrangler.jsonc`:
-
-```jsonc
-{
-  "vars": {
-    "ALLOWED_REPOS": "xiaoqianran/*",
-    "WRITE_BRANCH_PREFIX": "mygpt/",
-    "ENABLE_GIT_PUSH": "true"
-  }
-}
-```
-
-For tighter security, replace `xiaoqianran/*` with explicit comma-separated repositories.
-
-## Verify after deploy
+## Verify
 
 ```bash
 export BASE_URL="https://cloudflare-mygpt-github.<your-subdomain>.workers.dev"
@@ -196,52 +154,33 @@ export BASE_URL="https://cloudflare-mygpt-github.<your-subdomain>.workers.dev"
 curl "$BASE_URL/health"
 ```
 
-Expected version:
+Expected:
 
 ```json
-{"ok":true,"service":"cloudflare-mygpt-github","version":"0.3.0"}
+{"ok":true,"service":"cloudflare-mygpt-github","version":"0.4.0"}
 ```
 
-Verify the GPT control plane:
+Test native Git without cloning:
 
 ```bash
-curl -s "$BASE_URL/v1/repository/inspect" \
-  -H "Authorization: Bearer $GPT_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"repo":"xiaoqianran/cloudflare-mygpt-github"}'
-```
-
-Verify native Git without cloning the whole repository:
-
-```bash
-GIT_TRACE_CURL=1 git ls-remote \
+git ls-remote \
   "https://git@${BASE_URL#https://}/git/xiaoqianran/cloudflare-mygpt-github.git"
 ```
 
-Use `GIT_GATEWAY_TOKEN` when Git prompts for the password.
+Use `GIT_GATEWAY_TOKEN` as the password.
 
-## Configure Custom GPT
+Then test the full path:
 
-In **GPTs → Create → Configure → Actions**:
+```bash
+git clone "https://git@${BASE_URL#https://}/git/xiaoqianran/cloudflare-mygpt-github.git"
+cd cloudflare-mygpt-github
 
-1. Import `https://<your-worker>/openapi.json`.
-2. Authentication: **API Key → Bearer**.
-3. API key value: the same value stored in `GPT_API_KEY`.
-
-Do **not** put `GITHUB_TOKEN` or `GIT_GATEWAY_TOKEN` into the Custom GPT.
-
-Recommended instruction:
-
-```text
-For GitHub work, use the gateway actions. Inspect/search first, batch-read the relevant files, then use applyChanges for edits. Never ask me to paste repository files when the actions can read them. Use a mygpt/* working branch and create a draft PR unless I explicitly ask not to.
+echo test >> gateway-test.txt
+git add gateway-test.txt
+git commit -m "test: native Git gateway"
+git push origin main
 ```
 
-## Why the hybrid design
+## Limits
 
-A pure GitHub REST gateway is excellent for GPT Actions but cannot create a real local `.git` checkout. A completely transparent Git reverse proxy gives native Git semantics but weakens policy control over writes. v0.3 uses both:
-
-- **high-level JSON actions** where safety and deterministic AI behavior matter;
-- **streaming Smart HTTP** where native Git protocol compatibility matters;
-- native push is enabled and restricted to disposable `mygpt/*` branches.
-
-That keeps the gateway small while preserving both AI-agent workflows and real local Git workflows.
+The bridge streams Git pack data instead of buffering whole repositories in Worker memory. Cloudflare request-body limits still apply to pushes because push packfiles travel from the client into the Worker. Git LFS and submodule URL rewriting are not implemented by this project.
