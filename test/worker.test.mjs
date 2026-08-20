@@ -9,11 +9,11 @@ const envBase = {
   WRITE_BRANCH_PREFIX: "mygpt/",
 };
 
-function req(path, body, key = "test-gpt-key", method = "POST") {
+function req(path, body, key = "test-gpt-key") {
   return new Request(`https://gateway.example${path}`, {
-    method,
+    method: "POST",
     headers: { "content-type": "application/json", "x-api-key": key },
-    body: method === "POST" ? JSON.stringify(body) : undefined,
+    body: JSON.stringify(body),
   });
 }
 
@@ -28,113 +28,149 @@ function mockFetch(routes) {
   };
 }
 
-test("repo allowlist patterns", () => {
+test("allowlist wildcard", () => {
   assert.equal(matchesRepoPattern("xiaoqianran/demo", "xiaoqianran/*"), true);
   assert.equal(matchesRepoPattern("other/demo", "xiaoqianran/*"), false);
+});
+
+test("OpenAPI is GPT Actions friendly and schemas is an object", () => {
+  const spec = openApi("https://gateway.example");
+  assert.equal(spec.openapi, "3.1.0");
+  assert.equal(spec.servers[0].url, "https://gateway.example");
+  assert.ok(spec.components && typeof spec.components === "object");
+  assert.ok(spec.components.schemas && typeof spec.components.schemas === "object" && !Array.isArray(spec.components.schemas));
+  assert.ok(spec.components.responses && typeof spec.components.responses === "object");
+  assert.equal(Object.keys(spec.paths).length, 4);
+  assert.equal(spec.paths["/v1/changes/apply"].post.operationId, "applyChanges");
 });
 
 test("health and OpenAPI are public", async () => {
   const health = await worker.fetch(new Request("https://gateway.example/health"), {});
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).ok, true);
-
-  const spec = openApi("https://gateway.example");
-  assert.equal(spec.openapi, "3.1.0");
-  assert.ok(spec.paths["/v1/commit"]);
-  assert.equal(spec.servers[0].url, "https://gateway.example");
+  assert.equal((await health.json()).version, "0.2.0");
+  const schema = await worker.fetch(new Request("https://gateway.example/openapi.json"), {});
+  assert.equal(schema.status, 200);
+  assert.ok((await schema.json()).components.schemas.ApplyChangesRequest);
 });
 
-test("private endpoints require API key", async () => {
-  const res = await worker.fetch(req("/v1/tree", { repo: "xiaoqianran/demo" }, "wrong"), envBase);
+test("private actions require API key", async () => {
+  const res = await worker.fetch(req("/v1/repository/inspect", { repo: "xiaoqianran/demo" }, "wrong"), envBase);
   assert.equal(res.status, 401);
 });
 
-test("read file decodes GitHub base64", async () => {
-  const content = "hello 世界\n";
-  const b64 = Buffer.from(content, "utf8").toString("base64");
+test("inspect repository discovers default branch", async () => {
   const env = {
     ...envBase,
     __fetch: mockFetch({
-      "GET /repos/xiaoqianran/demo/contents/README.md?ref=main": { path: "README.md", sha: "blob1", size: content.length, encoding: "base64", content: b64 },
+      "GET /repos/xiaoqianran/demo": { default_branch: "dev", private: false, description: "demo", html_url: "https://github.com/xiaoqianran/demo" },
+      "GET /repos/xiaoqianran/demo/git/trees/dev?recursive=1": { tree: [{ path: "src/a.js", mode: "100644", type: "blob", sha: "a", size: 10 }], truncated: false },
     }),
   };
-  const res = await worker.fetch(req("/v1/files/read", { repo: "xiaoqianran/demo", path: "README.md" }), env);
+  const res = await worker.fetch(req("/v1/repository/inspect", { repo: "xiaoqianran/demo" }), env);
   assert.equal(res.status, 200);
-  assert.equal((await res.json()).content, content);
+  const out = await res.json();
+  assert.equal(out.default_branch, "dev");
+  assert.equal(out.ref, "dev");
+  assert.equal(out.items[0].path, "src/a.js");
 });
 
-test("direct writes to main are blocked", async () => {
-  const res = await worker.fetch(req("/v1/commit", {
-    repo: "xiaoqianran/demo", branch: "main", message: "bad", changes: [{ path: "a.txt", content: "x" }],
-  }), envBase);
-  assert.equal(res.status, 403);
-});
-
-test("sensitive workflow paths are blocked", async () => {
-  const res = await worker.fetch(req("/v1/commit", {
-    repo: "xiaoqianran/demo", branch: "mygpt/change", message: "bad", changes: [{ path: ".github/workflows/pwn.yml", content: "x" }],
-  }), envBase);
-  assert.equal(res.status, 403);
-});
-
-test("atomic commit builds blob tree commit and fast-forward ref", async () => {
-  let patchBody;
+test("batch read files decodes base64", async () => {
   const env = {
     ...envBase,
     __fetch: mockFetch({
-      "GET /repos/xiaoqianran/demo/git/ref/heads/mygpt%2Fchange": { object: { sha: "head1" } },
-      "GET /repos/xiaoqianran/demo/git/commits/head1": { tree: { sha: "tree0" } },
-      "POST /repos/xiaoqianran/demo/git/blobs": (init) => ({ sha: JSON.parse(init.body).content === "new" ? "blob-new" : "blob-other" }),
-      "POST /repos/xiaoqianran/demo/git/trees": { sha: "tree1" },
-      "POST /repos/xiaoqianran/demo/git/commits": { sha: "commit1" },
-      "PATCH /repos/xiaoqianran/demo/git/refs/heads/mygpt%2Fchange": (init) => { patchBody = JSON.parse(init.body); return { object: { sha: "commit1" } }; },
+      "GET /repos/xiaoqianran/demo/contents/a.txt?ref=main": { type: "file", path: "a.txt", sha: "a", size: 1, encoding: "base64", content: Buffer.from("A").toString("base64") },
+      "GET /repos/xiaoqianran/demo/contents/b.txt?ref=main": { type: "file", path: "b.txt", sha: "b", size: 1, encoding: "base64", content: Buffer.from("B").toString("base64") },
     }),
   };
-  const res = await worker.fetch(req("/v1/commit", {
+  const res = await worker.fetch(req("/v1/files/read", { repo: "xiaoqianran/demo", ref: "main", paths: ["a.txt", "b.txt"] }), env);
+  assert.equal(res.status, 200);
+  assert.deepEqual((await res.json()).files.map((f) => f.content), ["A", "B"]);
+});
+
+test("sensitive reads are blocked", async () => {
+  const res = await worker.fetch(req("/v1/files/read", { repo: "xiaoqianran/demo", ref: "main", paths: [".env"] }), envBase);
+  assert.equal(res.status, 403);
+});
+
+test("code search is scoped to allowed repository", async () => {
+  const env = {
+    ...envBase,
+    __fetch: mockFetch({
+      "GET /search/code?q=needle+repo%3Axiaoqianran%2Fdemo&per_page=5": { total_count: 1, items: [{ name: "a.js", path: "src/a.js", sha: "x", html_url: "https://github.com/xiaoqianran/demo/blob/main/src/a.js", text_matches: [] }] },
+    }),
+  };
+  const res = await worker.fetch(req("/v1/code/search", { repo: "xiaoqianran/demo", query: "needle", limit: 5 }), env);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).items[0].path, "src/a.js");
+});
+
+test("apply changes creates branch, atomic commit and draft PR", async () => {
+  let refPatch;
+  let prBody;
+  let branchReads = 0;
+  const baseFetch = mockFetch({
+    "GET /repos/xiaoqianran/demo": { default_branch: "main" },
+    "GET /repos/xiaoqianran/demo/git/ref/heads/main": { object: { sha: "main1" } },
+    "POST /repos/xiaoqianran/demo/git/refs": { object: { sha: "main1" } },
+    "GET /repos/xiaoqianran/demo/git/commits/main1": { tree: { sha: "tree0" } },
+    "POST /repos/xiaoqianran/demo/git/blobs": { sha: "blob1" },
+    "POST /repos/xiaoqianran/demo/git/trees": { sha: "tree1" },
+    "POST /repos/xiaoqianran/demo/git/commits": { sha: "commit1" },
+    "PATCH /repos/xiaoqianran/demo/git/refs/heads/mygpt%2Ffix": (init) => { refPatch = JSON.parse(init.body); return { object: { sha: "commit1" } }; },
+    "GET /repos/xiaoqianran/demo/pulls?state=open&head=xiaoqianran%3Amygpt%2Ffix&base=main": [],
+    "POST /repos/xiaoqianran/demo/pulls": (init) => { prBody = JSON.parse(init.body); return { number: 3, html_url: "https://github.com/xiaoqianran/demo/pull/3", state: "open", draft: true }; },
+  });
+  const env = {
+    ...envBase,
+    __fetch: async (url, init = {}) => {
+      const u = new URL(url);
+      if ((init.method || "GET") === "GET" && u.pathname === "/repos/xiaoqianran/demo/git/ref/heads/mygpt%2Ffix") {
+        branchReads += 1;
+        if (branchReads === 1) return new Response(JSON.stringify({ message: "Not Found" }), { status: 404, headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify({ object: { sha: "main1" } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return baseFetch(url, init);
+    },
+  };
+
+  const res = await worker.fetch(req("/v1/changes/apply", {
     repo: "xiaoqianran/demo",
-    branch: "mygpt/change",
-    message: "feat: change",
-    expected_head_sha: "head1",
-    changes: [{ path: "a.txt", content: "new" }, { path: "old.txt", delete: true }],
+    branch: "mygpt/fix",
+    message: "fix: demo",
+    changes: [{ path: "src/a.js", content: "export const a = 1;\n" }],
+    pull_request: { title: "Fix demo" },
   }), env);
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 200);
   const out = await res.json();
+  assert.equal(out.branch_created, true);
   assert.equal(out.commit_sha, "commit1");
-  assert.deepEqual(patchBody, { sha: "commit1", force: false });
+  assert.equal(out.pull_request.number, 3);
+  assert.deepEqual(refPatch, { sha: "commit1", force: false });
+  assert.equal(prBody.draft, true);
+});
+
+test("apply changes blocks direct main and workflow writes", async () => {
+  const main = await worker.fetch(req("/v1/changes/apply", {
+    repo: "xiaoqianran/demo", branch: "main", message: "x", changes: [{ path: "a.txt", content: "x" }],
+  }), envBase);
+  assert.equal(main.status, 403);
+
+  const workflow = await worker.fetch(req("/v1/changes/apply", {
+    repo: "xiaoqianran/demo", branch: "mygpt/x", message: "x", changes: [{ path: ".github/workflows/pwn.yml", content: "x" }],
+  }), envBase);
+  assert.equal(workflow.status, 403);
 });
 
 test("expected head mismatch returns 409", async () => {
   const env = {
     ...envBase,
     __fetch: mockFetch({
-      "GET /repos/xiaoqianran/demo/git/ref/heads/mygpt%2Fchange": { object: { sha: "new-head" } },
+      "GET /repos/xiaoqianran/demo": { default_branch: "main" },
+      "GET /repos/xiaoqianran/demo/git/ref/heads/mygpt%2Fx": { object: { sha: "new-head" } },
     }),
   };
-  const res = await worker.fetch(req("/v1/commit", {
-    repo: "xiaoqianran/demo",
-    branch: "mygpt/change",
-    message: "feat: change",
-    expected_head_sha: "old-head",
-    changes: [{ path: "a.txt", content: "new" }],
+  const res = await worker.fetch(req("/v1/changes/apply", {
+    repo: "xiaoqianran/demo", branch: "mygpt/x", message: "x", expected_head_sha: "old-head", changes: [{ path: "a.txt", content: "x" }],
   }), env);
   assert.equal(res.status, 409);
-});
-
-test("create branch and draft PR", async () => {
-  let prBody;
-  const env = {
-    ...envBase,
-    __fetch: mockFetch({
-      "GET /repos/xiaoqianran/demo/git/ref/heads/main": { object: { sha: "mainsha" } },
-      "POST /repos/xiaoqianran/demo/git/refs": { object: { sha: "mainsha" } },
-      "POST /repos/xiaoqianran/demo/pulls": (init) => { prBody = JSON.parse(init.body); return { number: 7, html_url: "https://github.com/xiaoqianran/demo/pull/7", state: "open", draft: true }; },
-    }),
-  };
-  const branch = await worker.fetch(req("/v1/branches", { repo: "xiaoqianran/demo", branch: "mygpt/test" }), env);
-  assert.equal(branch.status, 201);
-
-  const pr = await worker.fetch(req("/v1/pulls", { repo: "xiaoqianran/demo", head: "mygpt/test", title: "Test PR" }), env);
-  assert.equal(pr.status, 201);
-  assert.equal((await pr.json()).number, 7);
-  assert.equal(prBody.draft, true);
 });
