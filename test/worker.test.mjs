@@ -12,7 +12,7 @@ const envBase = {
 function req(path, body, key = "test-gpt-key") {
   return new Request(`https://gateway.example${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": key },
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
     body: JSON.stringify(body),
   });
 }
@@ -33,13 +33,17 @@ test("allowlist wildcard", () => {
   assert.equal(matchesRepoPattern("other/demo", "xiaoqianran/*"), false);
 });
 
-test("OpenAPI is GPT Actions friendly and schemas is an object", () => {
+test("OpenAPI is GPT Actions friendly and declares Bearer auth", () => {
   const spec = openApi("https://gateway.example");
   assert.equal(spec.openapi, "3.1.0");
+  assert.equal(spec.info.version, "0.2.1");
   assert.equal(spec.servers[0].url, "https://gateway.example");
   assert.ok(spec.components && typeof spec.components === "object");
   assert.ok(spec.components.schemas && typeof spec.components.schemas === "object" && !Array.isArray(spec.components.schemas));
   assert.ok(spec.components.responses && typeof spec.components.responses === "object");
+  assert.equal(spec.components.securitySchemes.BearerAuth.type, "http");
+  assert.equal(spec.components.securitySchemes.BearerAuth.scheme, "bearer");
+  assert.deepEqual(spec.security, [{ BearerAuth: [] }]);
   assert.equal(Object.keys(spec.paths).length, 4);
   assert.equal(spec.paths["/v1/changes/apply"].post.operationId, "applyChanges");
 });
@@ -47,14 +51,24 @@ test("OpenAPI is GPT Actions friendly and schemas is an object", () => {
 test("health and OpenAPI are public", async () => {
   const health = await worker.fetch(new Request("https://gateway.example/health"), {});
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, "0.2.0");
+  assert.equal((await health.json()).version, "0.2.1");
   const schema = await worker.fetch(new Request("https://gateway.example/openapi.json"), {});
   assert.equal(schema.status, 200);
   assert.ok((await schema.json()).components.schemas.ApplyChangesRequest);
 });
 
-test("private actions require API key", async () => {
+test("private actions require Bearer token", async () => {
   const res = await worker.fetch(req("/v1/repository/inspect", { repo: "xiaoqianran/demo" }, "wrong"), envBase);
+  assert.equal(res.status, 401);
+});
+
+test("legacy X-API-Key header is not accepted", async () => {
+  const request = new Request("https://gateway.example/v1/repository/inspect", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": "test-gpt-key" },
+    body: JSON.stringify({ repo: "xiaoqianran/demo" }),
+  });
+  const res = await worker.fetch(request, envBase);
   assert.equal(res.status, 401);
 });
 
