@@ -5,18 +5,21 @@
   "compatibility_date": "2026-08-20",
   "vars": {
     "ALLOWED_REPOS": "*",
+    "WRITE_BRANCH_PREFIX": "mygpt/",
     "MAX_MIRROR_FILE_BYTES": "1000000",
     "MAX_INDEX_CHARS": "120000"
   },
   "d1_databases": [
     {
       "binding": "REPO_DB",
-      "migrations_dir": "migrations"
+      "migrations_dir": "migrations",
+      "database_id": "8505e580-f006-4841-844f-9868d8a1bbbd"
     }
   ],
   "r2_buckets": [
     {
-      "binding": "REPO_BLOBS"
+      "binding": "REPO_BLOBS",
+      "bucket_name": "cloudflare-mygpt-github-repo-blobs"
     }
   ],
   "queues": {
