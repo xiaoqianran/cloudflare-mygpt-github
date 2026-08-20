@@ -2,24 +2,48 @@ import { HttpError } from "./errors.js";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
+const DEFAULT_GITHUB_USER_AGENT = "cloudflare-mygpt-github/0.6.1 (+https://github.com/xiaoqianran/cloudflare-mygpt-github)";
+
+export function githubUserAgent(env = {}) {
+  const configured = typeof env.GITHUB_USER_AGENT === "string" ? env.GITHUB_USER_AGENT.trim() : "";
+  return configured || DEFAULT_GITHUB_USER_AGENT;
+}
+
+export function githubApiHeaders(env, extra = {}) {
+  if (!env.GITHUB_TOKEN) throw new HttpError(500, "GITHUB_TOKEN secret is not configured");
+  return {
+    accept: "application/vnd.github+json",
+    authorization: `Bearer ${env.GITHUB_TOKEN}`,
+    "user-agent": githubUserAgent(env),
+    "x-github-api-version": GITHUB_API_VERSION,
+    ...extra,
+  };
+}
 
 export async function github(env, path, init = {}) {
   if (!env.GITHUB_TOKEN) throw new HttpError(500, "GITHUB_TOKEN secret is not configured");
   const transport = env.__fetch || fetch;
   const res = await transport(`${GITHUB_API}${path}`, {
     ...init,
-    headers: {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      "x-github-api-version": GITHUB_API_VERSION,
-      ...(init.headers || {}),
-    },
+    headers: githubApiHeaders(env, init.headers || {}),
   });
 
   const text = await res.text();
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch { payload = { message: text }; }
-  if (!res.ok) throw new HttpError(res.status, payload?.message || `GitHub API request failed (${res.status})`);
+  if (!res.ok) {
+    throw new HttpError(
+      res.status,
+      payload?.message || `GitHub API request failed (${res.status})`,
+      {
+        documentation_url: payload?.documentation_url,
+        errors: payload?.errors,
+        request_id: res.headers.get("x-github-request-id") || undefined,
+        rate_limit_remaining: res.headers.get("x-ratelimit-remaining") || undefined,
+        rate_limit_reset: res.headers.get("x-ratelimit-reset") || undefined,
+      },
+    );
+  }
   return payload;
 }
 
