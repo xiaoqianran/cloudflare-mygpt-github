@@ -4,8 +4,7 @@ import { normalizeRepo, assertRepoAllowed, validateReadPaths } from "./policy.js
 
 const DEFAULT_MAX_MIRROR_FILE_BYTES = 1_000_000;
 const DEFAULT_MAX_INDEX_CHARS = 120_000;
-const BLOB_BATCH_SIZE = 20;
-const SQL_BATCH_SIZE = 80;
+const MANIFEST_CHUNK_SIZE = 8;
 const QUEUE_SEND_BATCH_SIZE = 100;
 
 function requireMirrorBindings(env, { queue = false } = {}) {
@@ -53,7 +52,9 @@ function decodeCursor(cursor) {
     const binary = atob(padded);
     const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
     const parsed = JSON.parse(new TextDecoder().decode(bytes));
-    if (typeof parsed.path !== "string" || !Number.isInteger(parsed.offset) || parsed.offset < 0) throw new Error("bad cursor");
+    if (typeof parsed.path !== "string" || !Number.isInteger(parsed.offset) || parsed.offset < 0) {
+      throw new Error("bad cursor");
+    }
     return parsed;
   } catch {
     throw new HttpError(400, "invalid repository page cursor");
@@ -91,13 +92,18 @@ export async function startMirrorSync(env, input) {
   await env.REPO_DB.batch([
     env.REPO_DB.prepare(
       `INSERT INTO repositories
-         (repo, ref, status, sync_id, pending_batches, sync_started_at, last_error)
-       VALUES (?, ?, 'queued', ?, 0, ?, NULL)
+         (repo, ref, head_sha, status, sync_id, pending_batches, file_count,
+          mirrored_file_count, total_bytes, sync_started_at, last_error)
+       VALUES (?, ?, NULL, 'queued', ?, 0, 0, 0, 0, ?, NULL)
        ON CONFLICT(repo) DO UPDATE SET
          ref = excluded.ref,
+         head_sha = NULL,
          status = 'queued',
          sync_id = excluded.sync_id,
          pending_batches = 0,
+         file_count = 0,
+         mirrored_file_count = 0,
+         total_bytes = 0,
          sync_started_at = excluded.sync_started_at,
          last_error = NULL`,
     ).bind(repo, ref || "@default", syncId, startedAt),
@@ -176,13 +182,7 @@ async function readOneMirrorFile(env, repo, path, requestedRef, repositoryRow) {
   if (row && refMatches && row.cached && row.is_binary !== 1) {
     const object = await env.REPO_BLOBS.get(r2Key(row.blob_sha));
     if (object) {
-      return {
-        path,
-        sha: row.blob_sha,
-        size: row.size,
-        content: await object.text(),
-        source: "mirror",
-      };
+      return { path, sha: row.blob_sha, size: row.size, content: await object.text(), source: "mirror" };
     }
   }
 
@@ -246,13 +246,7 @@ export async function searchMirror(env, input) {
       LIMIT ?`,
   ).bind(repo, query, limit).all();
 
-  return {
-    repo,
-    query: input.query.trim(),
-    mirror_status: row.status,
-    head_sha: row.head_sha,
-    items: result.results || [],
-  };
+  return { repo, query: input.query.trim(), mirror_status: row.status, head_sha: row.head_sha, items: result.results || [] };
 }
 
 export async function readMirrorPage(env, input) {
@@ -290,10 +284,6 @@ export async function readMirrorPage(env, input) {
     const content = await object.text();
     const startOffset = file.path === cursor.path ? cursor.offset : 0;
     const remaining = maxChars - chars;
-    if (remaining <= 0) {
-      nextCursor = encodeCursor(lastCompletedPath, 0);
-      break;
-    }
     const piece = content.slice(startOffset, startOffset + remaining);
     files.push({
       path: file.path,
@@ -366,100 +356,14 @@ async function fallbackBlobText(env, repo, file) {
   return decodeBase64Utf8(blob.content);
 }
 
-async function indexBlobBatch(env, message) {
-  const prior = await env.REPO_DB.prepare(
-    `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = ?`,
-  ).bind(message.sync_id, message.batch_id).first();
-  if (prior?.status === "done") return;
-
-  const fetched = await githubGraphqlBlobs(env, message.repo, message.head_sha, message.files);
-  const statements = [];
-  let mirroredCount = 0;
-
-  for (const { file, blob } of fetched) {
-    const isBinary = blob?.isBinary === true;
-    let isTruncated = blob?.isTruncated === true;
-    let text = typeof blob?.text === "string" ? blob.text : null;
-
-    if (!isBinary && (text === null || isTruncated)) {
-      try {
-        text = await fallbackBlobText(env, message.repo, file);
-        isTruncated = false;
-      } catch {
-        text = null;
-      }
-    }
-
-    if (isBinary || text === null) {
-      statements.push(
-        env.REPO_DB.prepare(
-          `INSERT INTO mirror_blobs(blob_sha, size, is_binary, is_truncated, r2_key, cached_at)
-           VALUES (?, ?, 1, ?, NULL, CURRENT_TIMESTAMP)
-           ON CONFLICT(blob_sha) DO UPDATE SET is_binary = 1, is_truncated = excluded.is_truncated`,
-        ).bind(file.blob_sha, file.size || 0, isTruncated ? 1 : 0),
-        env.REPO_DB.prepare(
-          `UPDATE mirror_files SET cached = 0, is_binary = 1, is_indexed = 0, updated_at = CURRENT_TIMESTAMP
-            WHERE repo = ? AND path = ? AND blob_sha = ? AND sync_id = ?`,
-        ).bind(message.repo, file.path, file.blob_sha, message.sync_id),
-        env.REPO_DB.prepare(`DELETE FROM repo_fts WHERE repo = ? AND path = ?`).bind(message.repo, file.path),
-      );
-      continue;
-    }
-
-    const key = r2Key(file.blob_sha);
-    await env.REPO_BLOBS.put(key, text, {
-      httpMetadata: { contentType: "text/plain; charset=utf-8" },
-      customMetadata: { sha: file.blob_sha },
-    });
-    mirroredCount += 1;
-    const indexed = text.slice(0, maxIndexChars(env));
-    statements.push(
-      env.REPO_DB.prepare(
-        `INSERT INTO mirror_blobs(blob_sha, size, is_binary, is_truncated, r2_key, cached_at)
-         VALUES (?, ?, 0, ?, ?, CURRENT_TIMESTAMP)
-         ON CONFLICT(blob_sha) DO UPDATE SET
-           size = excluded.size, is_binary = 0, is_truncated = excluded.is_truncated,
-           r2_key = excluded.r2_key, cached_at = CURRENT_TIMESTAMP`,
-      ).bind(file.blob_sha, file.size || text.length, isTruncated ? 1 : 0, key),
-      env.REPO_DB.prepare(`DELETE FROM repo_fts WHERE repo = ? AND path = ?`).bind(message.repo, file.path),
-      env.REPO_DB.prepare(`INSERT INTO repo_fts(repo, path, content) VALUES (?, ?, ?)`).bind(message.repo, file.path, indexed),
-      env.REPO_DB.prepare(
-        `UPDATE mirror_files SET cached = 1, is_binary = 0, is_indexed = 1, updated_at = CURRENT_TIMESTAMP
-          WHERE repo = ? AND path = ? AND blob_sha = ? AND sync_id = ?`,
-      ).bind(message.repo, file.path, file.blob_sha, message.sync_id),
-    );
-  }
-
-  for (const group of chunks(statements, SQL_BATCH_SIZE)) await env.REPO_DB.batch(group);
-
-  // The first update is conditional on the batch not already being done. D1 batch()
-  // is transactional, so an at-least-once Queue delivery cannot double-decrement.
-  await env.REPO_DB.batch([
-    env.REPO_DB.prepare(
-      `UPDATE repositories
-          SET pending_batches = CASE WHEN pending_batches > 0 THEN pending_batches - 1 ELSE 0 END,
-              mirrored_file_count = mirrored_file_count + ?
-        WHERE repo = ? AND sync_id = ?
-          AND EXISTS (
-            SELECT 1 FROM sync_batches
-             WHERE sync_id = ? AND batch_id = ? AND status <> 'done'
-          )`,
-    ).bind(mirroredCount, message.repo, message.sync_id, message.sync_id, message.batch_id),
-    env.REPO_DB.prepare(
-      `UPDATE sync_batches SET status = 'done', completed_at = CURRENT_TIMESTAMP
-        WHERE sync_id = ? AND batch_id = ?`,
-    ).bind(message.sync_id, message.batch_id),
-  ]);
-
-  const repoRow = await getRepositoryRow(env, message.repo);
-  if (repoRow?.sync_id === message.sync_id && repoRow.pending_batches === 0) {
-    await finalizeSync(env, message.repo, message.sync_id);
-  }
-}
-
-async function finalizeSync(env, repo, syncId) {
+async function maybeFinalizeSync(env, repo, syncId) {
   const row = await getRepositoryRow(env, repo);
-  if (!row || row.sync_id !== syncId) return;
+  if (!row || row.sync_id !== syncId || row.pending_batches !== 0) return;
+  const manifest = await env.REPO_DB.prepare(
+    `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = '__manifest__'`,
+  ).bind(syncId).first();
+  if (manifest?.status !== "done") return;
+
   const truncated = row.last_error === "GitHub recursive tree was truncated";
   const statements = [];
   if (!truncated) {
@@ -477,50 +381,138 @@ async function finalizeSync(env, repo, syncId) {
     env.REPO_DB.prepare(
       `UPDATE repositories
           SET status = ?, pending_batches = 0, synced_at = ?
-        WHERE repo = ? AND sync_id = ?`,
+        WHERE repo = ? AND sync_id = ? AND pending_batches = 0`,
     ).bind(truncated ? "partial" : "ready", nowIso(), repo, syncId),
   );
   await env.REPO_DB.batch(statements);
 }
 
 async function processManifest(env, message) {
-  const manifestState = await env.REPO_DB.prepare(
+  const marker = await env.REPO_DB.prepare(
     `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = '__manifest__'`,
   ).bind(message.sync_id).first();
-  if (manifestState?.status === "done") return;
+  if (marker?.status === "done") return;
 
-  const current = await getRepositoryRow(env, message.repo);
+  let current = await getRepositoryRow(env, message.repo);
   if (!current || current.sync_id !== message.sync_id) return;
 
-  const meta = await github(env, `/repos/${message.repo}`);
-  const ref = message.ref || meta.default_branch || "main";
-  const commit = await github(env, `/repos/${message.repo}/commits/${encodeURIComponent(ref)}`);
-  const headSha = commit.sha;
+  let meta;
+  let ref;
+  let headSha;
+  let commit;
+
+  if (current.head_sha) {
+    ref = current.ref === "@default" ? (current.default_branch || "main") : current.ref;
+    headSha = current.head_sha;
+    commit = await github(env, `/repos/${message.repo}/commits/${headSha}`);
+    meta = { default_branch: current.default_branch || "main" };
+  } else {
+    meta = await github(env, `/repos/${message.repo}`);
+    ref = message.ref || meta.default_branch || "main";
+    commit = await github(env, `/repos/${message.repo}/commits/${encodeURIComponent(ref)}`);
+    headSha = commit.sha;
+  }
+
   const treeSha = commit.commit?.tree?.sha;
   if (!treeSha) throw new HttpError(502, "GitHub commit response did not contain tree SHA");
   const tree = await github(env, `/repos/${message.repo}/git/trees/${treeSha}?recursive=1`);
-  const files = (tree.tree || []).filter((entry) => entry.type === "blob").map((entry) => ({
-    path: entry.path,
-    blob_sha: entry.sha,
-    size: entry.size || 0,
-  }));
+  const files = (tree.tree || [])
+    .filter((entry) => entry.type === "blob")
+    .map((entry) => ({ path: entry.path, blob_sha: entry.sha, size: entry.size || 0 }));
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-  const existingResult = await env.REPO_DB.prepare(
-    `SELECT path, blob_sha, cached, is_binary, is_indexed FROM mirror_files WHERE repo = ?`,
-  ).bind(message.repo).all();
+  const fileChunks = chunks(files, MANIFEST_CHUNK_SIZE);
+
+  // Only the first manifest attempt initializes counters. Retries use the stored
+  // head SHA and do not reset progress already made by chunk consumers.
+  await env.REPO_DB.prepare(
+    `UPDATE repositories
+        SET ref = ?, head_sha = ?, default_branch = ?, status = ?, pending_batches = ?,
+            file_count = ?, mirrored_file_count = 0, total_bytes = ?, last_error = ?
+      WHERE repo = ? AND sync_id = ? AND head_sha IS NULL`,
+  ).bind(
+    ref,
+    headSha,
+    meta.default_branch || "main",
+    fileChunks.length ? "syncing" : (tree.truncated ? "partial" : "ready"),
+    fileChunks.length,
+    files.length,
+    totalBytes,
+    tree.truncated ? "GitHub recursive tree was truncated" : null,
+    message.repo,
+    message.sync_id,
+  ).run();
+
+  current = await getRepositoryRow(env, message.repo);
+  if (!current || current.sync_id !== message.sync_id) return;
+
+  const queueMessages = fileChunks.map((chunkFiles, index) => ({
+    body: {
+      type: "manifest-chunk",
+      repo: message.repo,
+      ref,
+      head_sha: headSha,
+      sync_id: message.sync_id,
+      batch_id: `manifest-${index}`,
+      files: chunkFiles,
+    },
+  }));
+
+  // Queue delivery is at-least-once. If one sendBatch call fails, the manifest
+  // message retries and resends deterministic chunk IDs; chunk handlers are idempotent.
+  for (const group of chunks(queueMessages, QUEUE_SEND_BATCH_SIZE)) {
+    if (group.length) await env.REPO_SYNC_QUEUE.sendBatch(group);
+  }
+
+  await env.REPO_DB.prepare(
+    `UPDATE sync_batches SET status = 'done', completed_at = CURRENT_TIMESTAMP
+      WHERE sync_id = ? AND batch_id = '__manifest__'`,
+  ).bind(message.sync_id).run();
+
+  await maybeFinalizeSync(env, message.repo, message.sync_id);
+}
+
+async function processManifestChunk(env, message) {
+  const current = await getRepositoryRow(env, message.repo);
+  if (!current || current.sync_id !== message.sync_id) return;
+
+  await env.REPO_DB.prepare(
+    `INSERT OR IGNORE INTO sync_batches(sync_id, batch_id, status, completed_at)
+     VALUES (?, ?, 'pending', NULL)`,
+  ).bind(message.sync_id, message.batch_id).run();
+  const prior = await env.REPO_DB.prepare(
+    `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = ?`,
+  ).bind(message.sync_id, message.batch_id).first();
+  if (prior?.status === "done") return;
+
+  const paths = message.files.map((file) => file.path);
+  const placeholders = paths.map(() => "?").join(",");
+  const existingResult = paths.length
+    ? await env.REPO_DB.prepare(
+      `SELECT path, blob_sha, cached, is_binary, is_indexed
+         FROM mirror_files WHERE repo = ? AND path IN (${placeholders})`,
+    ).bind(message.repo, ...paths).all()
+    : { results: [] };
   const existing = new Map((existingResult.results || []).map((row) => [row.path, row]));
   const mirrorLimit = maxMirrorBytes(env);
   const candidates = [];
   const upserts = [];
-  let unchangedCachedCount = 0;
+  const staleFtsDeletes = [];
+  let mirroredCurrent = 0;
 
-  for (const file of files) {
+  for (const file of message.files) {
     const old = existing.get(file.path);
     const unchanged = old?.blob_sha === file.blob_sha;
+    const oldCached = unchanged ? Number(old.cached || 0) : 0;
+    const oldBinary = unchanged ? old.is_binary : null;
+    const oldIndexed = unchanged ? Number(old.is_indexed || 0) : 0;
     const eligible = file.size <= mirrorLimit;
-    const knownHandled = unchanged && (Number(old.cached || 0) === 1 || Number(old.is_binary || 0) === 1);
+    const knownHandled = oldCached === 1 || Number(oldBinary || 0) === 1;
+
+    if (oldCached === 1) mirroredCurrent += 1;
     if (eligible && !knownHandled) candidates.push(file);
-    if (unchanged && Number(old.cached || 0) === 1) unchangedCachedCount += 1;
+    if (!unchanged && !eligible) {
+      staleFtsDeletes.push(env.REPO_DB.prepare(`DELETE FROM repo_fts WHERE repo = ? AND path = ?`).bind(message.repo, file.path));
+    }
 
     upserts.push(env.REPO_DB.prepare(
       `INSERT INTO mirror_files(repo, path, blob_sha, size, cached, is_binary, is_indexed, sync_id, updated_at)
@@ -538,60 +530,88 @@ async function processManifest(env, message) {
       file.path,
       file.blob_sha,
       file.size,
-      unchanged ? Number(old.cached || 0) : 0,
-      unchanged ? old.is_binary : null,
-      unchanged ? Number(old.is_indexed || 0) : 0,
+      oldCached,
+      oldBinary,
+      oldIndexed,
       message.sync_id,
     ));
   }
 
-  for (const group of chunks(upserts, SQL_BATCH_SIZE)) await env.REPO_DB.batch(group);
-  const fileBatches = chunks(candidates, BLOB_BATCH_SIZE);
-  const batchRows = fileBatches.map((_, index) => env.REPO_DB.prepare(
-    `INSERT OR IGNORE INTO sync_batches(sync_id, batch_id, status) VALUES (?, ?, 'pending')`,
-  ).bind(message.sync_id, `blob-${index}`));
-  for (const group of chunks(batchRows, SQL_BATCH_SIZE)) await env.REPO_DB.batch(group);
+  if (upserts.length) await env.REPO_DB.batch(upserts);
+  if (staleFtsDeletes.length) await env.REPO_DB.batch(staleFtsDeletes);
 
-  await env.REPO_DB.prepare(
-    `UPDATE repositories
-        SET ref = ?, head_sha = ?, default_branch = ?, status = ?, pending_batches = ?,
-            file_count = ?, mirrored_file_count = ?, total_bytes = ?, last_error = ?
-      WHERE repo = ? AND sync_id = ?`,
-  ).bind(
-    ref,
-    headSha,
-    meta.default_branch || "main",
-    fileBatches.length ? "syncing" : (tree.truncated ? "partial" : "ready"),
-    fileBatches.length,
-    files.length,
-    unchangedCachedCount,
-    totalBytes,
-    tree.truncated ? "GitHub recursive tree was truncated" : null,
-    message.repo,
-    message.sync_id,
-  ).run();
+  if (candidates.length) {
+    const fetched = await githubGraphqlBlobs(env, message.repo, message.head_sha, candidates);
+    const indexStatements = [];
 
-  const queueMessages = fileBatches.map((batchFiles, index) => ({
-    body: {
-      type: "blob-batch",
-      repo: message.repo,
-      ref,
-      head_sha: headSha,
-      sync_id: message.sync_id,
-      batch_id: `blob-${index}`,
-      files: batchFiles,
-    },
-  }));
-  for (const group of chunks(queueMessages, QUEUE_SEND_BATCH_SIZE)) {
-    if (group.length) await env.REPO_SYNC_QUEUE.sendBatch(group);
+    for (const { file, blob } of fetched) {
+      const isBinary = blob?.isBinary === true;
+      let isTruncated = blob?.isTruncated === true;
+      let text = typeof blob?.text === "string" ? blob.text : null;
+
+      if (!isBinary && (text === null || isTruncated)) {
+        text = await fallbackBlobText(env, message.repo, file);
+        isTruncated = false;
+      }
+
+      if (isBinary) {
+        indexStatements.push(
+          env.REPO_DB.prepare(`DELETE FROM repo_fts WHERE repo = ? AND path = ?`).bind(message.repo, file.path),
+          env.REPO_DB.prepare(
+            `UPDATE mirror_files
+                SET cached = 0, is_binary = 1, is_indexed = 0, updated_at = CURRENT_TIMESTAMP
+              WHERE repo = ? AND path = ? AND blob_sha = ? AND sync_id = ?`,
+          ).bind(message.repo, file.path, file.blob_sha, message.sync_id),
+        );
+        continue;
+      }
+
+      if (text === null) throw new HttpError(502, `unable to read GitHub blob text: ${file.path}`);
+      const key = r2Key(file.blob_sha);
+      await env.REPO_BLOBS.put(key, text, {
+        httpMetadata: { contentType: "text/plain; charset=utf-8" },
+        customMetadata: { sha: file.blob_sha, truncated: isTruncated ? "1" : "0" },
+      });
+      mirroredCurrent += 1;
+      indexStatements.push(
+        env.REPO_DB.prepare(`DELETE FROM repo_fts WHERE repo = ? AND path = ?`).bind(message.repo, file.path),
+        env.REPO_DB.prepare(`INSERT INTO repo_fts(repo, path, content) VALUES (?, ?, ?)`).bind(
+          message.repo,
+          file.path,
+          text.slice(0, maxIndexChars(env)),
+        ),
+        env.REPO_DB.prepare(
+          `UPDATE mirror_files
+              SET cached = 1, is_binary = 0, is_indexed = 1, updated_at = CURRENT_TIMESTAMP
+            WHERE repo = ? AND path = ? AND blob_sha = ? AND sync_id = ?`,
+        ).bind(message.repo, file.path, file.blob_sha, message.sync_id),
+      );
+    }
+
+    if (indexStatements.length) await env.REPO_DB.batch(indexStatements);
   }
 
-  await env.REPO_DB.prepare(
-    `UPDATE sync_batches SET status = 'done', completed_at = CURRENT_TIMESTAMP
-      WHERE sync_id = ? AND batch_id = '__manifest__'`,
-  ).bind(message.sync_id).run();
+  // One Queue message contains at most eight files, keeping the number of D1
+  // statements bounded even on the Workers/D1 free tier. The conditional update
+  // makes an at-least-once delivery unable to double-count completion.
+  await env.REPO_DB.batch([
+    env.REPO_DB.prepare(
+      `UPDATE repositories
+          SET pending_batches = CASE WHEN pending_batches > 0 THEN pending_batches - 1 ELSE 0 END,
+              mirrored_file_count = mirrored_file_count + ?
+        WHERE repo = ? AND sync_id = ?
+          AND EXISTS (
+            SELECT 1 FROM sync_batches
+             WHERE sync_id = ? AND batch_id = ? AND status <> 'done'
+          )`,
+    ).bind(mirroredCurrent, message.repo, message.sync_id, message.sync_id, message.batch_id),
+    env.REPO_DB.prepare(
+      `UPDATE sync_batches SET status = 'done', completed_at = CURRENT_TIMESTAMP
+        WHERE sync_id = ? AND batch_id = ?`,
+    ).bind(message.sync_id, message.batch_id),
+  ]);
 
-  if (fileBatches.length === 0) await finalizeSync(env, message.repo, message.sync_id);
+  await maybeFinalizeSync(env, message.repo, message.sync_id);
 }
 
 export async function handleMirrorQueue(batch, env) {
@@ -600,7 +620,7 @@ export async function handleMirrorQueue(batch, env) {
     try {
       const body = message.body || {};
       if (body.type === "manifest") await processManifest(env, body);
-      else if (body.type === "blob-batch") await indexBlobBatch(env, body);
+      else if (body.type === "manifest-chunk") await processManifestChunk(env, body);
       else throw new HttpError(400, `unknown mirror queue message: ${body.type}`);
       message.ack();
     } catch (error) {
