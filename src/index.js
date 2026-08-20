@@ -20,7 +20,7 @@ async function route(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.5.0" });
+    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.6.0" });
   }
   if (request.method === "GET" && url.pathname === "/openapi.json") {
     return json(openApi(url.origin));
