@@ -5,9 +5,17 @@
   "compatibility_date": "2026-08-20",
   "vars": {
     "ALLOWED_REPOS": "*",
-    "WRITE_BRANCH_PREFIX": "mygpt/",
-    "MAX_MIRROR_FILE_BYTES": "1000000",
-    "MAX_INDEX_CHARS": "120000"
+    "PINNED_REPOS": "xiaoqianran/*",
+    "MAX_MIRROR_FILE_BYTES": "524288",
+    "MAX_INDEX_CHARS": "20000",
+    "MAX_REPO_MIRROR_BYTES": "300000000",
+    "MAX_TOTAL_MIRROR_BYTES": "8000000000",
+    "MIRROR_TTL_DAYS": "7",
+    "R2_GC_MAX_OBJECTS": "500",
+    "MAX_EXPIRE_REPOS_PER_RUN": "20"
+  },
+  "triggers": {
+    "crons": ["17 3 * * *"]
   },
   "d1_databases": [
     {
