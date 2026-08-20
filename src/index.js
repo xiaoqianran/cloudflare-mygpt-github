@@ -9,6 +9,7 @@ import {
   readMirrorPage,
   handleMirrorQueue,
 } from "./mirror.js";
+import { touchRepository, enforceRepositoryBudget, runMirrorMaintenance } from "./cleanup.js";
 import { openApi as buildOpenApi } from "./openapi.js";
 import { handleGitBridge, parseGitRoute } from "./git-bridge.js";
 
@@ -20,7 +21,7 @@ async function route(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.6.1" });
+    return json({ ok: true, service: "cloudflare-mygpt-github", version: "0.7.0" });
   }
   if (request.method === "GET" && url.pathname === "/openapi.json") {
     return json(openApi(url.origin));
@@ -33,11 +34,31 @@ async function route(request, env) {
   if (request.method !== "POST") throw new HttpError(405, "method not allowed");
   const input = await bodyJson(request);
 
-  if (url.pathname === "/v1/repository/sync") return json(await startMirrorSync(env, input), 202);
-  if (url.pathname === "/v1/repository/inspect") return json(await inspectMirror(env, input));
-  if (url.pathname === "/v1/files/read") return json(await readMirrorFiles(env, input));
-  if (url.pathname === "/v1/repository/search") return json(await searchMirror(env, input));
-  if (url.pathname === "/v1/repository/page") return json(await readMirrorPage(env, input));
+  if (url.pathname === "/v1/repository/sync") {
+    const result = await startMirrorSync(env, input);
+    await touchRepository(env, input.repo);
+    return json(result, 202);
+  }
+  if (url.pathname === "/v1/repository/inspect") {
+    const result = await inspectMirror(env, input);
+    await touchRepository(env, input.repo);
+    return json(result);
+  }
+  if (url.pathname === "/v1/files/read") {
+    const result = await readMirrorFiles(env, input);
+    await touchRepository(env, input.repo);
+    return json(result);
+  }
+  if (url.pathname === "/v1/repository/search") {
+    const result = await searchMirror(env, input);
+    await touchRepository(env, input.repo);
+    return json(result);
+  }
+  if (url.pathname === "/v1/repository/page") {
+    const result = await readMirrorPage(env, input);
+    await touchRepository(env, input.repo);
+    return json(result);
+  }
   if (url.pathname === "/v1/changes/apply") return json(await applyChanges(env, input));
   throw new HttpError(404, "not found");
 }
@@ -63,6 +84,12 @@ export default {
 
   async queue(batch, env) {
     await handleMirrorQueue(batch, env);
+    const repos = new Set(batch.messages.map((message) => message.body?.repo).filter(Boolean));
+    for (const repo of repos) await enforceRepositoryBudget(env, repo);
+  },
+
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(runMirrorMaintenance(env));
   },
 };
 
