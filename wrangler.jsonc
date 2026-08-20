@@ -4,8 +4,7 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-20",
   "vars": {
-    "ALLOWED_REPOS": "xiaoqianran/*",
-    "WRITE_BRANCH_PREFIX": "mygpt/",
+    "ALLOWED_REPOS": "*",
     "MAX_MIRROR_FILE_BYTES": "1000000",
     "MAX_INDEX_CHARS": "120000"
   },
