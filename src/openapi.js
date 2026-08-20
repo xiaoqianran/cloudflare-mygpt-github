@@ -17,8 +17,8 @@ export function openApi(origin) {
     openapi: "3.1.0",
     info: {
       title: "MyGPT GitHub Repository Mirror",
-      version: "0.5.0",
-      description: "Fast GitHub repository access for Custom GPT. Reads come from a Cloudflare D1/R2 mirror; GitHub is used for sync and writes.",
+      version: "0.6.0",
+      description: "Fast GitHub repository access for Custom GPT. All repositories are accepted by the gateway; actual private/read/write capability is determined by GITHUB_TOKEN permissions and GitHub repository rules. Reads come from a Cloudflare D1/R2 mirror; GitHub is used for sync and writes.",
     },
     servers: [{ url: origin }],
     security: [{ BearerAuth: [] }],
@@ -33,7 +33,7 @@ export function openApi(origin) {
       },
       schemas: {
         SyncRepositoryRequest: objectSchema({
-          repo: { type: "string", description: "Repository in owner/name format" },
+          repo: { type: "string", description: "Any GitHub repository in owner/name format. Access is limited only by GITHUB_TOKEN and GitHub itself." },
           ref: { type: "string", description: "Optional branch, tag, or commit. Defaults to the repository default branch." },
         }, ["repo"]),
         InspectRepositoryRequest: objectSchema({
@@ -68,9 +68,9 @@ export function openApi(origin) {
           draft: { type: "boolean", default: true },
         }),
         ApplyChangesRequest: objectSchema({
-          repo: { type: "string" },
+          repo: { type: "string", description: "Any repository writable by GITHUB_TOKEN." },
           base: { type: "string" },
-          branch: { type: "string" },
+          branch: { type: "string", description: "Any valid branch name, including the default branch when GitHub permits direct writes." },
           message: { type: "string" },
           expected_head_sha: { type: "string" },
           changes: { type: "array", minItems: 1, maxItems: limits.MAX_CHANGES, items: { $ref: "#/components/schemas/FileChange" } },
@@ -85,7 +85,7 @@ export function openApi(origin) {
       responses: {
         BadRequest: { description: "Bad request", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } } } },
         Unauthorized: { description: "Unauthorized", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } } } },
-        Forbidden: { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } } } },
+        Forbidden: { description: "GitHub or configured repository policy denied access", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } } } },
         Conflict: { description: "Mirror not ready or branch head changed", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } } } },
       },
     },
@@ -139,7 +139,7 @@ export function openApi(origin) {
         post: {
           operationId: "applyChanges",
           summary: "Commit multiple file changes and optionally create or reuse a pull request",
-          description: "Write path remains GitHub-backed. Read the relevant files from the mirror before editing.",
+          description: "Writes may target any repository, valid path and valid branch that GITHUB_TOKEN and GitHub repository rules allow. Read the relevant files from the mirror before editing.",
           requestBody: jsonBody({ $ref: "#/components/schemas/ApplyChangesRequest" }),
           responses: { "200": { description: "Changes applied" }, "400": { $ref: "#/components/responses/BadRequest" }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" } },
         },
