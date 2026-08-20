@@ -30,7 +30,7 @@
     "consumers": [
       {
         "queue": "cloudflare-mygpt-github-sync",
-        "max_batch_size": 5,
+        "max_batch_size": 1,
         "max_batch_timeout": 1
       }
     ]
