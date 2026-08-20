@@ -38,6 +38,28 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function encodeCursor(path, offset = 0) {
+  const bytes = new TextEncoder().encode(JSON.stringify({ path, offset }));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+
+function decodeCursor(cursor) {
+  if (!cursor) return { path: "", offset: 0 };
+  try {
+    const normalized = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (typeof parsed.path !== "string" || !Number.isInteger(parsed.offset) || parsed.offset < 0) throw new Error("bad cursor");
+    return parsed;
+  } catch {
+    throw new HttpError(400, "invalid repository page cursor");
+  }
+}
+
 async function getRepositoryRow(env, repo) {
   return env.REPO_DB.prepare(
     `SELECT repo, ref, head_sha, default_branch, status, sync_id, pending_batches,
@@ -50,6 +72,18 @@ export async function startMirrorSync(env, input) {
   requireMirrorBindings(env, { queue: true });
   const repo = normalizeRepo(input.repo);
   assertRepoAllowed(env, repo);
+  const current = await getRepositoryRow(env, repo);
+  if (current && (current.status === "queued" || current.status === "syncing") && input.force !== true) {
+    return {
+      repo,
+      ref: current.ref === "@default" ? null : current.ref,
+      sync_id: current.sync_id,
+      status: current.status,
+      already_running: true,
+      pending_batches: current.pending_batches,
+    };
+  }
+
   const ref = typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : "";
   const syncId = crypto.randomUUID();
   const startedAt = nowIso();
@@ -82,7 +116,7 @@ export async function startMirrorSync(env, input) {
     throw error;
   }
 
-  return { repo, ref: ref || null, sync_id: syncId, status: "queued" };
+  return { repo, ref: ref || null, sync_id: syncId, status: "queued", already_running: false };
 }
 
 export async function inspectMirror(env, input) {
@@ -98,8 +132,6 @@ export async function inspectMirror(env, input) {
     ? input.path.replace(/^\/+|\/+$/g, "")
     : "";
   const limit = Number.isInteger(input.limit) ? Math.min(Math.max(input.limit, 1), 2000) : 500;
-  const like = prefix ? `${prefix}/%` : "%";
-  const exact = prefix || "";
   const query = prefix
     ? `SELECT path, blob_sha AS sha, size, cached, is_binary, is_indexed
          FROM mirror_files
@@ -109,7 +141,7 @@ export async function inspectMirror(env, input) {
          FROM mirror_files
         WHERE repo = ? ORDER BY path LIMIT ?`;
   const stmt = prefix
-    ? env.REPO_DB.prepare(query).bind(repo, exact, like, limit)
+    ? env.REPO_DB.prepare(query).bind(repo, prefix, `${prefix}/%`, limit)
     : env.REPO_DB.prepare(query).bind(repo, limit);
   const result = await stmt.all();
 
@@ -119,7 +151,7 @@ export async function inspectMirror(env, input) {
     head_sha: row.head_sha,
     default_branch: row.default_branch,
     status: row.status,
-    ready: row.status === "ready",
+    ready: row.status === "ready" || row.status === "partial",
     sync_id: row.sync_id,
     pending_batches: row.pending_batches,
     file_count: row.file_count,
@@ -133,14 +165,14 @@ export async function inspectMirror(env, input) {
   };
 }
 
-async function readOneMirrorFile(env, repo, path, requestedRef) {
+async function readOneMirrorFile(env, repo, path, requestedRef, repositoryRow) {
   const row = await env.REPO_DB.prepare(
-    `SELECT f.path, f.blob_sha, f.size, f.cached, f.is_binary, r.ref, r.head_sha, r.status
-       FROM mirror_files f JOIN repositories r ON r.repo = f.repo
-      WHERE f.repo = ? AND f.path = ?`,
+    `SELECT path, blob_sha, size, cached, is_binary
+       FROM mirror_files WHERE repo = ? AND path = ?`,
   ).bind(repo, path).first();
 
-  const refMatches = !requestedRef || !row || requestedRef === row.ref || requestedRef === row.head_sha;
+  const mirrorRef = repositoryRow?.ref === "@default" ? repositoryRow?.default_branch : repositoryRow?.ref;
+  const refMatches = !requestedRef || requestedRef === mirrorRef || requestedRef === repositoryRow?.head_sha;
   if (row && refMatches && row.cached && row.is_binary !== 1) {
     const object = await env.REPO_BLOBS.get(r2Key(row.blob_sha));
     if (object) {
@@ -154,7 +186,7 @@ async function readOneMirrorFile(env, repo, path, requestedRef) {
     }
   }
 
-  const ref = requestedRef || (row && row.ref !== "@default" ? row.ref : undefined) || "main";
+  const ref = requestedRef || mirrorRef || repositoryRow?.default_branch || "main";
   const params = new URLSearchParams({ ref });
   const file = await github(env, `/repos/${repo}/contents/${encodeRepoPath(path)}?${params}`);
   if (Array.isArray(file) || file.type !== "file") throw new HttpError(400, `path is not a regular file: ${path}`);
@@ -173,17 +205,19 @@ export async function readMirrorFiles(env, input) {
   assertRepoAllowed(env, repo);
   const paths = validateReadPaths(input.paths);
   const requestedRef = typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : "";
-  const files = await Promise.all(paths.map((path) => readOneMirrorFile(env, repo, path, requestedRef)));
+  const repositoryRow = await getRepositoryRow(env, repo);
+  const files = await Promise.all(paths.map((path) => readOneMirrorFile(env, repo, path, requestedRef, repositoryRow)));
   return {
     repo,
-    ref: requestedRef || null,
+    ref: requestedRef || (repositoryRow?.ref === "@default" ? repositoryRow?.default_branch : repositoryRow?.ref) || null,
+    mirror_status: repositoryRow?.status || "missing",
     files,
     mirror_hits: files.filter((file) => file.source === "mirror").length,
     github_fallbacks: files.filter((file) => file.source !== "mirror").length,
   };
 }
 
-function ftsQuery(input) {
+export function buildFtsQuery(input) {
   const tokens = String(input || "")
     .normalize("NFKC")
     .match(/[\p{L}\p{N}_.$/-]{2,}/gu) || [];
@@ -196,11 +230,11 @@ export async function searchMirror(env, input) {
   assertRepoAllowed(env, repo);
   if (typeof input.query !== "string" || !input.query.trim()) throw new HttpError(400, "query is required");
   const limit = Number.isInteger(input.limit) ? Math.min(Math.max(input.limit, 1), 50) : 20;
-  const query = ftsQuery(input.query);
+  const query = buildFtsQuery(input.query);
   if (!query) throw new HttpError(400, "query contains no searchable terms");
 
   const row = await getRepositoryRow(env, repo);
-  if (!row || row.status === "missing") throw new HttpError(409, "repository mirror is missing; call syncRepository first");
+  if (!row) throw new HttpError(409, "repository mirror is missing; call syncRepository first");
 
   const result = await env.REPO_DB.prepare(
     `SELECT path,
@@ -228,48 +262,73 @@ export async function readMirrorPage(env, input) {
   const row = await getRepositoryRow(env, repo);
   if (!row) throw new HttpError(409, "repository mirror is missing; call syncRepository first");
 
-  const cursor = typeof input.cursor === "string" ? input.cursor : "";
+  const cursor = decodeCursor(typeof input.cursor === "string" ? input.cursor : "");
   const maxChars = Number.isInteger(input.max_chars) ? Math.min(Math.max(input.max_chars, 10_000), 250_000) : 120_000;
   const maxFiles = Number.isInteger(input.max_files) ? Math.min(Math.max(input.max_files, 1), 100) : 40;
-  const result = await env.REPO_DB.prepare(
-    `SELECT path, blob_sha, size
-       FROM mirror_files
-      WHERE repo = ? AND cached = 1 AND COALESCE(is_binary, 0) = 0 AND path > ?
-      ORDER BY path
-      LIMIT ?`,
-  ).bind(repo, cursor, maxFiles + 1).all();
+  const query = cursor.offset > 0
+    ? `SELECT path, blob_sha, size FROM mirror_files
+        WHERE repo = ? AND cached = 1 AND COALESCE(is_binary, 0) = 0 AND path >= ?
+        ORDER BY path LIMIT ?`
+    : `SELECT path, blob_sha, size FROM mirror_files
+        WHERE repo = ? AND cached = 1 AND COALESCE(is_binary, 0) = 0 AND path > ?
+        ORDER BY path LIMIT ?`;
+  const result = await env.REPO_DB.prepare(query).bind(repo, cursor.path, maxFiles + 1).all();
   const rows = result.results || [];
   const files = [];
   let chars = 0;
-  let lastScanned = cursor;
-  let stoppedByBudget = false;
+  let lastCompletedPath = cursor.offset > 0 ? "" : cursor.path;
+  let nextCursor = null;
+  let processedRows = 0;
 
   for (const file of rows.slice(0, maxFiles)) {
     const object = await env.REPO_BLOBS.get(r2Key(file.blob_sha));
-    lastScanned = file.path;
-    if (!object) continue;
+    processedRows += 1;
+    if (!object) {
+      lastCompletedPath = file.path;
+      continue;
+    }
     const content = await object.text();
-    if (files.length > 0 && chars + content.length > maxChars) {
-      stoppedByBudget = true;
+    const startOffset = file.path === cursor.path ? cursor.offset : 0;
+    const remaining = maxChars - chars;
+    if (remaining <= 0) {
+      nextCursor = encodeCursor(lastCompletedPath, 0);
       break;
     }
-    files.push({ path: file.path, sha: file.blob_sha, size: file.size, content });
-    chars += content.length;
+    const piece = content.slice(startOffset, startOffset + remaining);
+    files.push({
+      path: file.path,
+      sha: file.blob_sha,
+      size: file.size,
+      offset: startOffset,
+      content: piece,
+      complete: startOffset + piece.length >= content.length,
+    });
+    chars += piece.length;
+
+    if (startOffset + piece.length < content.length) {
+      nextCursor = encodeCursor(file.path, startOffset + piece.length);
+      break;
+    }
+
+    lastCompletedPath = file.path;
     if (chars >= maxChars) {
-      stoppedByBudget = true;
+      nextCursor = encodeCursor(file.path, 0);
       break;
     }
   }
 
-  const hasMore = stoppedByBudget || rows.length > maxFiles;
+  if (!nextCursor && (rows.length > maxFiles || processedRows < rows.length)) {
+    nextCursor = encodeCursor(lastCompletedPath, 0);
+  }
+
   return {
     repo,
-    ref: row.ref === "@default" ? null : row.ref,
+    ref: row.ref === "@default" ? row.default_branch : row.ref,
     head_sha: row.head_sha,
     mirror_status: row.status,
     files,
     returned_chars: chars,
-    next_cursor: hasMore && lastScanned ? lastScanned : null,
+    next_cursor: nextCursor,
   };
 }
 
@@ -318,7 +377,7 @@ async function indexBlobBatch(env, message) {
   let mirroredCount = 0;
 
   for (const { file, blob } of fetched) {
-    let isBinary = blob?.isBinary === true;
+    const isBinary = blob?.isBinary === true;
     let isTruncated = blob?.isTruncated === true;
     let text = typeof blob?.text === "string" ? blob.text : null;
 
@@ -373,6 +432,8 @@ async function indexBlobBatch(env, message) {
 
   for (const group of chunks(statements, SQL_BATCH_SIZE)) await env.REPO_DB.batch(group);
 
+  // The first update is conditional on the batch not already being done. D1 batch()
+  // is transactional, so an at-least-once Queue delivery cannot double-decrement.
   await env.REPO_DB.batch([
     env.REPO_DB.prepare(
       `UPDATE repositories
@@ -397,20 +458,29 @@ async function indexBlobBatch(env, message) {
 }
 
 async function finalizeSync(env, repo, syncId) {
-  await env.REPO_DB.batch([
-    env.REPO_DB.prepare(
-      `DELETE FROM repo_fts
-        WHERE repo = ? AND path IN (
-          SELECT path FROM mirror_files WHERE repo = ? AND sync_id <> ?
-        )`,
-    ).bind(repo, repo, syncId),
-    env.REPO_DB.prepare(`DELETE FROM mirror_files WHERE repo = ? AND sync_id <> ?`).bind(repo, syncId),
+  const row = await getRepositoryRow(env, repo);
+  if (!row || row.sync_id !== syncId) return;
+  const truncated = row.last_error === "GitHub recursive tree was truncated";
+  const statements = [];
+  if (!truncated) {
+    statements.push(
+      env.REPO_DB.prepare(
+        `DELETE FROM repo_fts
+          WHERE repo = ? AND path IN (
+            SELECT path FROM mirror_files WHERE repo = ? AND sync_id <> ?
+          )`,
+      ).bind(repo, repo, syncId),
+      env.REPO_DB.prepare(`DELETE FROM mirror_files WHERE repo = ? AND sync_id <> ?`).bind(repo, syncId),
+    );
+  }
+  statements.push(
     env.REPO_DB.prepare(
       `UPDATE repositories
-          SET status = 'ready', pending_batches = 0, synced_at = ?, last_error = NULL
+          SET status = ?, pending_batches = 0, synced_at = ?
         WHERE repo = ? AND sync_id = ?`,
-    ).bind(nowIso(), repo, syncId),
-  ]);
+    ).bind(truncated ? "partial" : "ready", nowIso(), repo, syncId),
+  );
+  await env.REPO_DB.batch(statements);
 }
 
 async function processManifest(env, message) {
@@ -418,6 +488,9 @@ async function processManifest(env, message) {
     `SELECT status FROM sync_batches WHERE sync_id = ? AND batch_id = '__manifest__'`,
   ).bind(message.sync_id).first();
   if (manifestState?.status === "done") return;
+
+  const current = await getRepositoryRow(env, message.repo);
+  if (!current || current.sync_id !== message.sync_id) return;
 
   const meta = await github(env, `/repos/${message.repo}`);
   const ref = message.ref || meta.default_branch || "main";
@@ -439,12 +512,16 @@ async function processManifest(env, message) {
   const mirrorLimit = maxMirrorBytes(env);
   const candidates = [];
   const upserts = [];
+  let unchangedCachedCount = 0;
 
   for (const file of files) {
     const old = existing.get(file.path);
     const unchanged = old?.blob_sha === file.blob_sha;
     const eligible = file.size <= mirrorLimit;
-    if (eligible && !(unchanged && old.cached)) candidates.push(file);
+    const knownHandled = unchanged && (Number(old.cached || 0) === 1 || Number(old.is_binary || 0) === 1);
+    if (eligible && !knownHandled) candidates.push(file);
+    if (unchanged && Number(old.cached || 0) === 1) unchangedCachedCount += 1;
+
     upserts.push(env.REPO_DB.prepare(
       `INSERT INTO mirror_files(repo, path, blob_sha, size, cached, is_binary, is_indexed, sync_id, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -478,15 +555,16 @@ async function processManifest(env, message) {
   await env.REPO_DB.prepare(
     `UPDATE repositories
         SET ref = ?, head_sha = ?, default_branch = ?, status = ?, pending_batches = ?,
-            file_count = ?, mirrored_file_count = 0, total_bytes = ?, last_error = ?
+            file_count = ?, mirrored_file_count = ?, total_bytes = ?, last_error = ?
       WHERE repo = ? AND sync_id = ?`,
   ).bind(
     ref,
     headSha,
     meta.default_branch || "main",
-    fileBatches.length ? "syncing" : "ready",
+    fileBatches.length ? "syncing" : (tree.truncated ? "partial" : "ready"),
     fileBatches.length,
     files.length,
+    unchangedCachedCount,
     totalBytes,
     tree.truncated ? "GitHub recursive tree was truncated" : null,
     message.repo,
