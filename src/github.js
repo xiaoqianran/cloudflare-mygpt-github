@@ -2,7 +2,7 @@ import { HttpError } from "./errors.js";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
-const DEFAULT_GITHUB_USER_AGENT = "cloudflare-mygpt-github/0.7.0 (+https://github.com/xiaoqianran/cloudflare-mygpt-github)";
+const DEFAULT_GITHUB_USER_AGENT = "cloudflare-mygpt-github/0.6.1 (+https://github.com/xiaoqianran/cloudflare-mygpt-github)";
 
 export function githubUserAgent(env = {}) {
   const configured = typeof env.GITHUB_USER_AGENT === "string" ? env.GITHUB_USER_AGENT.trim() : "";
