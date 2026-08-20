@@ -36,10 +36,10 @@ test("high-level writes no longer block main or repository paths", () => {
   assert.equal(assertWritablePath(".env"), ".env");
 });
 
-test("OpenAPI exposes the v0.6 mirror tool surface", () => {
+test("OpenAPI exposes the v0.6.1 mirror tool surface", () => {
   const spec = openApi("https://gateway.example");
   assert.equal(spec.openapi, "3.1.0");
-  assert.equal(spec.info.version, "0.6.0");
+  assert.equal(spec.info.version, "0.6.1");
   assert.equal(spec.servers[0].url, "https://gateway.example");
   assert.ok(spec.components && typeof spec.components === "object");
   assert.ok(spec.components.schemas && typeof spec.components.schemas === "object" && !Array.isArray(spec.components.schemas));
@@ -55,7 +55,7 @@ test("OpenAPI exposes the v0.6 mirror tool surface", () => {
 test("health and OpenAPI stay public", async () => {
   const health = await worker.fetch(new Request("https://gateway.example/health"), {});
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).version, "0.6.0");
+  assert.equal((await health.json()).version, "0.6.1");
 
   const schema = await worker.fetch(new Request("https://gateway.example/openapi.json"), {});
   assert.equal(schema.status, 200);
